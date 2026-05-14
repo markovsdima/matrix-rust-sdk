@@ -22,7 +22,7 @@ Given the number of platforms targeted, we have broken out a number of features
 Each supported target should use features to build the relevant system. Here are some suggested feature flags for the major platforms:
 
 - Android: `"bundled-sqlite,unstable-msc4274,sentry"`
-- iOS: `"bundled-sqlite,unstable-msc4274,sentry"`
+- iOS: `"sqlite,unstable-msc4274,sentry"` when the app provides SQLite or SQLCipher.
 - JavaScript/Wasm: `"indexeddb,unstable-msc4274"`
 
 ### Swift/iOS sync

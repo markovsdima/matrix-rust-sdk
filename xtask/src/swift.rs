@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
+    env,
     fs::{copy, create_dir_all, remove_dir_all, remove_file, rename},
+    path::PathBuf,
+    process::Command,
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -160,7 +163,10 @@ impl Platform {
 const FFI_LIBRARY_NAME: &str = "libmatrix_sdk_ffi.a";
 
 /// The features enabled for the FFI library.
-const FFI_FEATURES: &str = "sentry";
+const FFI_FEATURES: &str = "sqlite,sentry,unstable-msc4274,experimental-element-recent-emojis,experimental-push-secrets,experimental-search";
+
+const SQLITE_DEFINED_SYMBOL: &str = " T _sqlite3_";
+const SQLITE_UNDEFINED_SYMBOL: &str = " U _sqlite3_";
 
 /// The list of targets supported by the SDK.
 const TARGETS: &[Target] = &[
@@ -231,13 +237,20 @@ fn build_library() -> Result<()> {
     create_dir_all(ffi_directory.as_path())?;
 
     let sh = sh();
-    cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi --features {FFI_FEATURES}").run()?;
+    cmd!(
+        sh,
+        "rustup run stable cargo build -p matrix-sdk-ffi --no-default-features --features {FFI_FEATURES}"
+    )
+    .run()?;
 
-    rename(lib_output_dir.join(FFI_LIBRARY_NAME), ffi_directory.join(FFI_LIBRARY_NAME))?;
+    let library_path = ffi_directory.join(FFI_LIBRARY_NAME);
+    rename(lib_output_dir.join(FFI_LIBRARY_NAME), &library_path)?;
+    verify_sqlite_symbols(&[library_path.clone()])?;
+
     let swift_directory = root_directory.join("bindings/apple/generated/swift");
     create_dir_all(swift_directory.as_path())?;
 
-    generate_uniffi(&ffi_directory.join(FFI_LIBRARY_NAME), &ffi_directory)?;
+    generate_uniffi(&library_path, &ffi_directory)?;
 
     let module_map_file = ffi_directory.join("module.modulemap");
     if module_map_file.exists() {
@@ -305,6 +318,7 @@ fn build_xcframework(
         watchos_deployment_target,
     )?;
     let libs = lipo_platform_libraries(&platform_build_paths, &generated_dir)?;
+    verify_sqlite_symbols(&libs)?;
 
     println!("-- Generating uniffi files");
     let uniffi_lib_path = platform_build_paths.values().next().unwrap().first().unwrap().clone();
@@ -323,7 +337,7 @@ fn build_xcframework(
     }
     let sh = sh();
     let mut cmd = cmd!(sh, "xcodebuild -create-xcframework");
-    for p in libs {
+    for p in &libs {
         cmd = cmd.arg("-library").arg(p).arg("-headers").arg(&headers_dir)
     }
     cmd.arg("-output").arg(&xcframework_path).run()?;
@@ -393,10 +407,10 @@ fn build_targets(
 
             println!("-- Building for {}", target.description);
             if target.status == TargetStatus::TopTier {
-                cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi --target {triple} --profile {profile} --features {FFI_FEATURES}")
+                cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi --no-default-features --target {triple} --profile {profile} --features {FFI_FEATURES}")
                     .run()?;
             } else {
-                cmd!(sh, "rustup run nightly cargo build -p matrix-sdk-ffi -Zbuild-std --target {triple} --profile {profile} --features {FFI_FEATURES}")
+                cmd!(sh, "rustup run nightly cargo build -p matrix-sdk-ffi -Zbuild-std --no-default-features --target {triple} --profile {profile} --features {FFI_FEATURES}")
                     .run()?;
             }
         }
@@ -406,7 +420,8 @@ fn build_targets(
 
         if !stable_targets.is_empty() {
             let triples = stable_targets.iter().map(|target| target.triple).collect::<Vec<_>>();
-            let mut cmd = cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi");
+            let mut cmd =
+                cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi --no-default-features");
             for triple in &triples {
                 cmd = cmd.arg("--target").arg(triple);
             }
@@ -418,7 +433,10 @@ fn build_targets(
 
         if !tier3_targets.is_empty() {
             let triples = tier3_targets.iter().map(|target| target.triple).collect::<Vec<_>>();
-            let mut cmd = cmd!(sh, "rustup run nightly cargo build -p matrix-sdk-ffi -Zbuild-std");
+            let mut cmd = cmd!(
+                sh,
+                "rustup run nightly cargo build -p matrix-sdk-ffi -Zbuild-std --no-default-features"
+            );
             for triple in &triples {
                 cmd = cmd.arg("--target").arg(triple);
             }
@@ -480,6 +498,88 @@ fn lipo_platform_libraries(
         libs.push(output_path);
     }
     Ok(libs)
+}
+
+fn verify_sqlite_symbols(libraries: &[Utf8PathBuf]) -> Result<()> {
+    let llvm_nm = find_llvm_nm()?;
+
+    for library in libraries {
+        println!("-- Verifying SQLite symbols in {library}");
+        let output = Command::new(&llvm_nm).arg("-g").arg(library.as_std_path()).output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("llvm-nm failed for {library}: {stderr}").into());
+        }
+
+        let stdout = String::from_utf8(output.stdout)?;
+        let defined_symbols =
+            stdout.lines().filter(|line| line.contains(SQLITE_DEFINED_SYMBOL)).collect::<Vec<_>>();
+        if !defined_symbols.is_empty() {
+            let examples = defined_symbols.iter().take(10).copied().collect::<Vec<_>>().join("\n");
+            return Err(format!(
+                "{library} defines sqlite3 symbols; MatrixSDKFFI must leave SQLite to the app:\n{examples}"
+            )
+            .into());
+        }
+
+        let has_undefined_symbols =
+            stdout.lines().any(|line| line.contains(SQLITE_UNDEFINED_SYMBOL));
+        if !has_undefined_symbols {
+            return Err(format!(
+                "{library} has no undefined sqlite3 references; expected U _sqlite3_* references"
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn find_llvm_nm() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("LLVM_NM") {
+        return Ok(path.into());
+    }
+
+    if let Ok(path) = rust_toolchain_llvm_nm("stable") {
+        return Ok(path);
+    }
+
+    if Command::new("llvm-nm").arg("--version").output().is_ok() {
+        return Ok("llvm-nm".into());
+    }
+
+    Err("could not find llvm-nm; install the rustup llvm-tools component or set LLVM_NM".into())
+}
+
+fn rust_toolchain_llvm_nm(toolchain: &str) -> Result<PathBuf> {
+    let sysroot = rustup_stdout(toolchain, &["rustc", "--print", "sysroot"])?;
+    let version = rustup_stdout(toolchain, &["rustc", "-vV"])?;
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or_else(|| format!("could not determine {toolchain} rustc host triple"))?;
+    let candidate = PathBuf::from(sysroot.trim())
+        .join("lib")
+        .join("rustlib")
+        .join(host)
+        .join("bin")
+        .join("llvm-nm");
+
+    if candidate.exists() {
+        Ok(candidate)
+    } else {
+        Err(format!("{candidate:?} does not exist").into())
+    }
+}
+
+fn rustup_stdout(toolchain: &str, command: &[&str]) -> Result<String> {
+    let output = Command::new("rustup").arg("run").arg(toolchain).args(command).output()?;
+    if output.status.success() {
+        Ok(String::from_utf8(output.stdout)?)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("rustup run {toolchain} {} failed: {stderr}", command.join(" ")).into())
+    }
 }
 
 /// Moves all files of the specified file extension from one directory into

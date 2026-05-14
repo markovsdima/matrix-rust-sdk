@@ -25,6 +25,10 @@ The `build-framework` task will go through all the steps required to generate a 
 4. `xcodebuild` an `xcframework` from the fat static libs and the original iOS one, and add the header and module map to it under `generated/MatrixSDKFFI.xcframework`
 5. cleanup and delete the generated files except the .xcframework and the swift sources (that aren't part of the framework)
 
+The SDK framework is built without bundled SQLite. The build task verifies the
+final static archives contain no defined `_sqlite3_*` symbols while retaining
+undefined references for the app-provided SQLite or SQLCipher provider.
+
 For development purposes, it will additionally generate a `Package.swift` file in the root of the repo that can be used to add the framework to your project and enable debugging through the use of [rust-xcode-plugin](https://github.com/BrainiumLLC/rust-xcode-plugin) (make sure to run the task with the argument `--profile=reldbg`).
 
 When building the SDK for release you should pass the `--release` argument to the task, which will strip away any symbols and optimise the created binary.

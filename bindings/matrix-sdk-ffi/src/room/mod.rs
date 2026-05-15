@@ -466,6 +466,36 @@ impl Room {
         Ok(())
     }
 
+    /// Send a raw event to the room with a caller-provided transaction ID,
+    /// returning the event ID from the server response.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_type` - The type of the event to send.
+    ///
+    /// * `content` - The content of the event to send encoded as JSON string.
+    ///
+    /// * `transaction_id` - The transaction ID to use for the event.
+    pub async fn send_raw_with_transaction_id_returning_event_id(
+        &self,
+        event_type: String,
+        content: String,
+        transaction_id: String,
+    ) -> Result<String, ClientError> {
+        let content_json: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| ClientError::Generic {
+                msg: format!("Failed to parse JSON: {e}"),
+                details: Some(format!("{e:?}")),
+            })?;
+
+        let txn_id: OwnedTransactionId = transaction_id.into();
+
+        let result =
+            self.inner.send_raw(&event_type, content_json).with_transaction_id(&txn_id).await?;
+
+        Ok(result.response.event_id.to_string())
+    }
+
     /// Send a raw state event to the room.
     ///
     /// # Arguments

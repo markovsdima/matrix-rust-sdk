@@ -57,6 +57,7 @@ use ruma::{
             join_rules::JoinRule as RumaJoinRule,
             message::{
                 AddMentions, AudioMessageEventContent as RumaAudioMessageEventContent,
+                FileMessageEventContent as RumaFileMessageEventContent,
                 ImageMessageEventContent as RumaImageMessageEventContent,
                 MessageType as RumaMessageType, RoomMessageEventContent,
                 RoomMessageEventContentWithoutRelation, UnstableAmplitude,
@@ -75,7 +76,7 @@ use crate::{
     client::{JoinRule, ProgressWatcher, RoomVisibility},
     error::{
         ClientError, LiveLocationError, MediaInfoError, NotYetImplemented, QueueWedgeError,
-        RoomError, UploadedImageError, UploadedVideoError, UploadedVoiceError,
+        RoomError, UploadedFileError, UploadedImageError, UploadedVideoError, UploadedVoiceError,
     },
     event::TimelineEvent,
     identity_status_change::IdentityStatusChange,
@@ -83,9 +84,9 @@ use crate::{
     room_member::{RoomMember, RoomMemberWithSenderInfo},
     room_preview::RoomPreview,
     ruma::{
-        AudioInfo, AudioMessageContent, FileInfo, FormattedBody, ImageInfo, ImageMessageContent,
-        MediaSource, MessageFormat, ThumbnailInfo, UnstableAudioDetailsContent,
-        UnstableVoiceContent, VideoInfo, VideoMessageContent,
+        AudioInfo, AudioMessageContent, FileInfo, FileMessageContent, FormattedBody, ImageInfo,
+        ImageMessageContent, MediaSource, MessageFormat, ThumbnailInfo,
+        UnstableAudioDetailsContent, UnstableVoiceContent, VideoInfo, VideoMessageContent,
     },
     runtime::get_runtime_handle,
     timeline::{
@@ -874,6 +875,133 @@ impl Room {
                 .make_reply_event(content_without_relation, reply)
                 .await
                 .map_err(map_reply_error_for_video)?
+        } else {
+            RoomMessageEventContent::from(content_without_relation)
+        };
+
+        let txn_id: OwnedTransactionId = transaction_id.into();
+        let result = self.inner.send(content).with_transaction_id(txn_id).await?;
+
+        Ok(result.response.event_id.to_string())
+    }
+
+    /// Upload a file and optional thumbnail for a later typed `m.file` event.
+    ///
+    /// The returned JSON string is opaque to the caller and should be persisted
+    /// as-is until it is passed to
+    /// [`send_uploaded_file_with_transaction_id_returning_event_id`].
+    ///
+    /// If provided, `progress_watcher` reports progress for the original file
+    /// upload. Thumbnail upload progress is intentionally omitted.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_file_for_event(
+        &self,
+        file_path: String,
+        thumbnail_file_path: Option<String>,
+        mimetype: String,
+        size: u64,
+        thumbnail_mimetype: Option<String>,
+        thumbnail_size: Option<u64>,
+        thumbnail_width: Option<u64>,
+        thumbnail_height: Option<u64>,
+        progress_watcher: Option<Box<dyn ProgressWatcher>>,
+    ) -> Result<String, UploadedFileError> {
+        let mimetype = parse_file_mimetype(&mimetype, "mimetype")?;
+        let size = validate_positive_uint(size, "size")?;
+        let file = validate_local_media_file(&file_path, size, "file_path")?;
+
+        let thumbnail = read_thumbnail_input(
+            thumbnail_file_path,
+            thumbnail_mimetype,
+            thumbnail_size,
+            thumbnail_width,
+            thumbnail_height,
+        )?;
+
+        let is_encrypted = self.inner.latest_encryption_state().await?.is_encrypted();
+
+        let (thumbnail_source, thumbnail_info) = if let Some(thumbnail) = thumbnail {
+            let thumbnail_source =
+                upload_media_source(&self.inner, is_encrypted, &thumbnail.mimetype, thumbnail.data)
+                    .await?;
+
+            (
+                Some(thumbnail_source),
+                Some(UploadedThumbnailInfo {
+                    mimetype: thumbnail.mimetype.essence_str().to_owned(),
+                    size: thumbnail.size,
+                    width: thumbnail.width,
+                    height: thumbnail.height,
+                }),
+            )
+        } else {
+            (None, None)
+        };
+
+        let media_source = upload_media_source_from_path(
+            &self.inner,
+            is_encrypted,
+            &mimetype,
+            &file.path,
+            progress_watcher,
+        )
+        .await?;
+
+        let uploaded = UploadedFile {
+            schema_version: UPLOADED_FILE_SCHEMA_VERSION,
+            kind: UPLOADED_FILE_KIND.to_owned(),
+            is_encrypted,
+            filename: file.filename,
+            media_source,
+            thumbnail_source,
+            file_info: UploadedFileInfo { mimetype: mimetype.essence_str().to_owned(), size },
+            thumbnail_info,
+            original_mimetype: mimetype.essence_str().to_owned(),
+        };
+
+        serde_json::to_string(&uploaded).map_err(UploadedFileError::validation_err)
+    }
+
+    /// Send a previously uploaded file as a typed `m.file` event with a
+    /// caller-provided transaction ID, returning the homeserver event ID.
+    pub async fn send_uploaded_file_with_transaction_id_returning_event_id(
+        &self,
+        uploaded_file_json: String,
+        transaction_id: String,
+        caption: Option<String>,
+        formatted_caption: Option<String>,
+        reply_event_id: Option<String>,
+    ) -> Result<String, UploadedFileError> {
+        let uploaded: UploadedFile =
+            serde_json::from_str(&uploaded_file_json).map_err(UploadedFileError::validation_err)?;
+        uploaded.validate()?;
+
+        let is_encrypted = self.inner.latest_encryption_state().await?.is_encrypted();
+        if uploaded.is_encrypted != is_encrypted {
+            return Err(UploadedFileError::validation(
+                format!(
+                    "Uploaded file encryption mismatch: uploaded is_encrypted={}, current room is_encrypted={}",
+                    uploaded.is_encrypted, is_encrypted
+                ),
+                None,
+            ));
+        }
+
+        let content_without_relation = uploaded.into_message_content(caption, formatted_caption)?;
+
+        let content = if let Some(reply_event_id) = reply_event_id {
+            let event_id =
+                EventId::parse(reply_event_id).map_err(UploadedFileError::validation_err)?;
+            let reply = Reply {
+                event_id,
+                enforce_thread: EnforceThread::MaybeThreaded,
+                add_mentions: AddMentions::Yes,
+            };
+
+            self.inner
+                .make_reply_event(content_without_relation, reply)
+                .await
+                .map_err(map_reply_error_for_file)?
         } else {
             RoomMessageEventContent::from(content_without_relation)
         };
@@ -2220,6 +2348,141 @@ struct UploadedVideoInfo {
     blurhash: Option<String>,
 }
 
+const UPLOADED_FILE_SCHEMA_VERSION: u16 = 1;
+const UPLOADED_FILE_KIND: &str = "file";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UploadedFile {
+    schema_version: u16,
+    kind: String,
+    is_encrypted: bool,
+    filename: String,
+    media_source: RumaMediaSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail_source: Option<RumaMediaSource>,
+    file_info: UploadedFileInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thumbnail_info: Option<UploadedThumbnailInfo>,
+    original_mimetype: String,
+}
+
+impl UploadedFile {
+    fn validate(&self) -> Result<(), UploadedFileError> {
+        if self.schema_version != UPLOADED_FILE_SCHEMA_VERSION {
+            return Err(UploadedFileError::validation(
+                format!("Unsupported UploadedFile schema_version: {}", self.schema_version),
+                None,
+            ));
+        }
+
+        if self.kind != UPLOADED_FILE_KIND {
+            return Err(UploadedFileError::validation(
+                format!("Unsupported UploadedFile kind: {}", self.kind),
+                None,
+            ));
+        }
+
+        if self.filename.is_empty() {
+            return Err(UploadedFileError::validation("UploadedFile filename is empty", None));
+        }
+
+        validate_positive_uint(self.file_info.size, "file_info.size")?;
+        parse_file_mimetype(&self.original_mimetype, "original_mimetype")?;
+        parse_file_mimetype(&self.file_info.mimetype, "file_info.mimetype")?;
+
+        if self.file_info.mimetype != self.original_mimetype {
+            return Err(UploadedFileError::validation(
+                "UploadedFile file_info.mimetype does not match original_mimetype",
+                None,
+            ));
+        }
+
+        validate_media_source_matches(
+            &self.media_source,
+            self.is_encrypted,
+            "media_source",
+            "UploadedFile",
+        )?;
+
+        match (&self.thumbnail_source, &self.thumbnail_info) {
+            (Some(source), Some(info)) => {
+                validate_media_source_matches(
+                    source,
+                    self.is_encrypted,
+                    "thumbnail_source",
+                    "UploadedFile",
+                )?;
+                validate_positive_uint(info.size, "thumbnail_info.size")?;
+                validate_positive_uint(info.width, "thumbnail_info.width")?;
+                validate_positive_uint(info.height, "thumbnail_info.height")?;
+                parse_image_mimetype(&info.mimetype, "thumbnail_info.mimetype")?;
+            }
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(UploadedFileError::validation(
+                    "UploadedFile thumbnail_source is present without thumbnail_info",
+                    None,
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(UploadedFileError::validation(
+                    "UploadedFile thumbnail_info is present without thumbnail_source",
+                    None,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn into_message_content(
+        self,
+        caption: Option<String>,
+        formatted_caption: Option<String>,
+    ) -> Result<RoomMessageEventContentWithoutRelation, UploadedFileError> {
+        let source = ffi_media_source(self.media_source, "media_source")?;
+        let thumbnail_source = self
+            .thumbnail_source
+            .map(|source| ffi_media_source(source, "thumbnail_source"))
+            .transpose()?;
+
+        let formatted_caption =
+            formatted_caption.map(|body| FormattedBody { format: MessageFormat::Html, body });
+        let caption = if formatted_caption.is_some() && caption.is_none() {
+            Some(String::new())
+        } else {
+            caption
+        };
+
+        let file_content: RumaFileMessageEventContent = FileMessageContent {
+            filename: self.filename,
+            caption,
+            formatted_caption,
+            source,
+            info: Some(FileInfo {
+                mimetype: Some(self.original_mimetype),
+                size: Some(self.file_info.size),
+                thumbnail_info: self.thumbnail_info.map(|info| ThumbnailInfo {
+                    height: Some(info.height),
+                    width: Some(info.width),
+                    mimetype: Some(info.mimetype),
+                    size: Some(info.size),
+                }),
+                thumbnail_source,
+            }),
+        }
+        .into();
+
+        Ok(RoomMessageEventContentWithoutRelation::new(RumaMessageType::File(file_content)))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UploadedFileInfo {
+    mimetype: String,
+    size: u64,
+}
+
 struct LocalMediaPath {
     path: PathBuf,
     filename: String,
@@ -2421,6 +2684,15 @@ fn parse_video_mimetype(mimetype: &str, field_name: &str) -> Result<Mime, Upload
     Ok(mimetype)
 }
 
+fn parse_file_mimetype(mimetype: &str, field_name: &str) -> Result<Mime, UploadedFileError> {
+    mimetype.parse::<Mime>().map_err(|error| {
+        UploadedFileError::validation(
+            format!("Invalid {field_name}: {mimetype}"),
+            Some(format!("{error:?}")),
+        )
+    })
+}
+
 fn validate_duration(duration: Duration, field_name: &str) -> Result<(), UploadedVoiceError> {
     if duration.is_zero() {
         return Err(UploadedVoiceError::validation(
@@ -2604,6 +2876,21 @@ fn map_reply_error_for_video(error: ReplyError) -> UploadedVideoError {
         }
         ReplyError::StateEvent => {
             UploadedVideoError::validation("Cannot reply to a state event", details)
+        }
+    }
+}
+
+fn map_reply_error_for_file(error: ReplyError) -> UploadedFileError {
+    let details = Some(format!("{error:?}"));
+    match error {
+        ReplyError::Fetch(_) => {
+            UploadedFileError::retryable("Failed to fetch replied-to event", details)
+        }
+        ReplyError::Deserialization => {
+            UploadedFileError::validation("Failed to deserialize replied-to event", details)
+        }
+        ReplyError::StateEvent => {
+            UploadedFileError::validation("Cannot reply to a state event", details)
         }
     }
 }

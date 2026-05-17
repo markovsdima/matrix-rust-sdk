@@ -19,6 +19,7 @@ use std::{
     path::{Path, PathBuf},
     pin::pin,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -55,9 +56,10 @@ use ruma::{
             history_visibility::HistoryVisibility as RumaHistoryVisibility,
             join_rules::JoinRule as RumaJoinRule,
             message::{
-                AddMentions, ImageMessageEventContent as RumaImageMessageEventContent,
+                AddMentions, AudioMessageEventContent as RumaAudioMessageEventContent,
+                ImageMessageEventContent as RumaImageMessageEventContent,
                 MessageType as RumaMessageType, RoomMessageEventContent,
-                RoomMessageEventContentWithoutRelation,
+                RoomMessageEventContentWithoutRelation, UnstableAmplitude,
             },
         },
     },
@@ -72,7 +74,7 @@ use crate::{
     client::{JoinRule, RoomVisibility},
     error::{
         ClientError, LiveLocationError, MediaInfoError, NotYetImplemented, QueueWedgeError,
-        RoomError, UploadedImageError,
+        RoomError, UploadedImageError, UploadedVoiceError,
     },
     event::TimelineEvent,
     identity_status_change::IdentityStatusChange,
@@ -80,8 +82,9 @@ use crate::{
     room_member::{RoomMember, RoomMemberWithSenderInfo},
     room_preview::RoomPreview,
     ruma::{
-        AudioInfo, FileInfo, FormattedBody, ImageInfo, ImageMessageContent, MediaSource,
-        MessageFormat, ThumbnailInfo, VideoInfo,
+        AudioInfo, AudioMessageContent, FileInfo, FormattedBody, ImageInfo, ImageMessageContent,
+        MediaSource, MessageFormat, ThumbnailInfo, UnstableAudioDetailsContent,
+        UnstableVoiceContent, VideoInfo,
     },
     runtime::get_runtime_handle,
     timeline::{
@@ -637,6 +640,97 @@ impl Room {
                 .make_reply_event(content_without_relation, reply)
                 .await
                 .map_err(map_reply_error)?
+        } else {
+            RoomMessageEventContent::from(content_without_relation)
+        };
+
+        let txn_id: OwnedTransactionId = transaction_id.into();
+        let result = self.inner.send(content).with_transaction_id(txn_id).await?;
+
+        Ok(result.response.event_id.to_string())
+    }
+
+    /// Upload a voice message for a later typed `m.audio` voice event.
+    ///
+    /// The returned JSON string is opaque to the caller and should be persisted
+    /// as-is until it is passed to
+    /// [`send_uploaded_voice_with_transaction_id_returning_event_id`].
+    pub async fn upload_voice_for_event(
+        &self,
+        file_path: String,
+        mimetype: String,
+        size: u64,
+        duration: Duration,
+        waveform: Vec<f32>,
+    ) -> Result<String, UploadedVoiceError> {
+        let mimetype = parse_audio_mimetype(&mimetype, "mimetype")?;
+        let size = validate_positive_uint(size, "size")?;
+        validate_duration(duration, "duration")?;
+        validate_waveform(&waveform, "waveform")?;
+        let file = read_local_media_file(&file_path, size, "file_path")?;
+
+        let is_encrypted = self.inner.latest_encryption_state().await?.is_encrypted();
+
+        let media_source =
+            upload_media_source(&self.inner, is_encrypted, &mimetype, file.data).await?;
+
+        let uploaded = UploadedVoice {
+            schema_version: UPLOADED_VOICE_SCHEMA_VERSION,
+            kind: UPLOADED_VOICE_KIND.to_owned(),
+            is_encrypted,
+            filename: file.filename,
+            media_source,
+            voice_info: UploadedVoiceInfo {
+                mimetype: mimetype.essence_str().to_owned(),
+                size,
+                duration,
+                waveform,
+            },
+            original_mimetype: mimetype.essence_str().to_owned(),
+        };
+
+        serde_json::to_string(&uploaded).map_err(UploadedVoiceError::validation_err)
+    }
+
+    /// Send a previously uploaded voice message as a typed `m.audio` voice
+    /// event with a caller-provided transaction ID, returning the homeserver
+    /// event ID.
+    pub async fn send_uploaded_voice_with_transaction_id_returning_event_id(
+        &self,
+        uploaded_voice_json: String,
+        transaction_id: String,
+        reply_event_id: Option<String>,
+    ) -> Result<String, UploadedVoiceError> {
+        let uploaded: UploadedVoice = serde_json::from_str(&uploaded_voice_json)
+            .map_err(UploadedVoiceError::validation_err)?;
+        uploaded.validate()?;
+
+        let is_encrypted = self.inner.latest_encryption_state().await?.is_encrypted();
+        if uploaded.is_encrypted != is_encrypted {
+            return Err(UploadedVoiceError::validation(
+                format!(
+                    "Uploaded voice encryption mismatch: uploaded is_encrypted={}, current room is_encrypted={}",
+                    uploaded.is_encrypted, is_encrypted
+                ),
+                None,
+            ));
+        }
+
+        let content_without_relation = uploaded.into_message_content()?;
+
+        let content = if let Some(reply_event_id) = reply_event_id {
+            let event_id =
+                EventId::parse(reply_event_id).map_err(UploadedVoiceError::validation_err)?;
+            let reply = Reply {
+                event_id,
+                enforce_thread: EnforceThread::MaybeThreaded,
+                add_mentions: AddMentions::Yes,
+            };
+
+            self.inner
+                .make_reply_event(content_without_relation, reply)
+                .await
+                .map_err(map_reply_error_for_voice)?
         } else {
             RoomMessageEventContent::from(content_without_relation)
         };
@@ -1711,6 +1805,93 @@ struct UploadedThumbnailInfo {
     height: u64,
 }
 
+const UPLOADED_VOICE_SCHEMA_VERSION: u16 = 1;
+const UPLOADED_VOICE_KIND: &str = "voice";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UploadedVoice {
+    schema_version: u16,
+    kind: String,
+    is_encrypted: bool,
+    filename: String,
+    media_source: RumaMediaSource,
+    voice_info: UploadedVoiceInfo,
+    original_mimetype: String,
+}
+
+impl UploadedVoice {
+    fn validate(&self) -> Result<(), UploadedVoiceError> {
+        if self.schema_version != UPLOADED_VOICE_SCHEMA_VERSION {
+            return Err(UploadedVoiceError::validation(
+                format!("Unsupported UploadedVoice schema_version: {}", self.schema_version),
+                None,
+            ));
+        }
+
+        if self.kind != UPLOADED_VOICE_KIND {
+            return Err(UploadedVoiceError::validation(
+                format!("Unsupported UploadedVoice kind: {}", self.kind),
+                None,
+            ));
+        }
+
+        if self.filename.is_empty() {
+            return Err(UploadedVoiceError::validation("UploadedVoice filename is empty", None));
+        }
+
+        validate_positive_uint(self.voice_info.size, "voice_info.size")?;
+        validate_duration(self.voice_info.duration, "voice_info.duration")?;
+        validate_waveform(&self.voice_info.waveform, "voice_info.waveform")?;
+        parse_audio_mimetype(&self.original_mimetype, "original_mimetype")?;
+        parse_audio_mimetype(&self.voice_info.mimetype, "voice_info.mimetype")?;
+
+        if self.voice_info.mimetype != self.original_mimetype {
+            return Err(UploadedVoiceError::validation(
+                "UploadedVoice voice_info.mimetype does not match original_mimetype",
+                None,
+            ));
+        }
+
+        validate_media_source_matches(&self.media_source, self.is_encrypted, "media_source")?;
+
+        Ok(())
+    }
+
+    fn into_message_content(
+        self,
+    ) -> Result<RoomMessageEventContentWithoutRelation, UploadedVoiceError> {
+        let source = ffi_media_source(self.media_source, "media_source")?;
+        let duration = self.voice_info.duration;
+        let audio_content: RumaAudioMessageEventContent = AudioMessageContent {
+            filename: self.filename,
+            caption: None,
+            formatted_caption: None,
+            source,
+            info: Some(AudioInfo {
+                duration: Some(duration),
+                size: Some(self.voice_info.size),
+                mimetype: Some(self.original_mimetype),
+            }),
+            audio: Some(UnstableAudioDetailsContent {
+                duration,
+                waveform: scale_voice_waveform(&self.voice_info.waveform),
+            }),
+            voice: Some(UnstableVoiceContent {}),
+        }
+        .into();
+
+        Ok(RoomMessageEventContentWithoutRelation::new(RumaMessageType::Audio(audio_content)))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UploadedVoiceInfo {
+    mimetype: String,
+    size: u64,
+    duration: Duration,
+    waveform: Vec<f32>,
+}
+
 struct LocalMediaFile {
     data: Vec<u8>,
     filename: String,
@@ -1841,6 +2022,53 @@ fn parse_image_mimetype(mimetype: &str, field_name: &str) -> Result<Mime, Upload
     Ok(mimetype)
 }
 
+fn parse_audio_mimetype(mimetype: &str, field_name: &str) -> Result<Mime, UploadedVoiceError> {
+    let mimetype = mimetype.parse::<Mime>().map_err(|error| {
+        UploadedVoiceError::validation(
+            format!("Invalid {field_name}: {mimetype}"),
+            Some(format!("{error:?}")),
+        )
+    })?;
+
+    if mimetype.type_() != mime::AUDIO {
+        return Err(UploadedVoiceError::validation(
+            format!("{field_name} must be audio/*, got {}", mimetype.essence_str()),
+            None,
+        ));
+    }
+
+    Ok(mimetype)
+}
+
+fn validate_duration(duration: Duration, field_name: &str) -> Result<(), UploadedVoiceError> {
+    if duration.is_zero() {
+        return Err(UploadedVoiceError::validation(
+            format!("{field_name} must be greater than 0"),
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_waveform(waveform: &[f32], field_name: &str) -> Result<(), UploadedVoiceError> {
+    if let Some(invalid_index) = waveform.iter().position(|value| !value.is_finite()) {
+        return Err(UploadedVoiceError::validation(
+            format!("{field_name} contains a non-finite value at index {invalid_index}"),
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
+fn scale_voice_waveform(waveform: &[f32]) -> Vec<u16> {
+    waveform
+        .iter()
+        .map(|value| ((*value).clamp(0.0, 1.0) * UnstableAmplitude::MAX as f32) as u16)
+        .collect()
+}
+
 async fn upload_media_source(
     room: &SdkRoom,
     is_encrypted: bool,
@@ -1901,6 +2129,21 @@ fn map_reply_error(error: ReplyError) -> UploadedImageError {
         }
         ReplyError::StateEvent => {
             UploadedImageError::validation("Cannot reply to a state event", details)
+        }
+    }
+}
+
+fn map_reply_error_for_voice(error: ReplyError) -> UploadedVoiceError {
+    let details = Some(format!("{error:?}"));
+    match error {
+        ReplyError::Fetch(_) => {
+            UploadedVoiceError::retryable("Failed to fetch replied-to event", details)
+        }
+        ReplyError::Deserialization => {
+            UploadedVoiceError::validation("Failed to deserialize replied-to event", details)
+        }
+        ReplyError::StateEvent => {
+            UploadedVoiceError::validation("Cannot reply to a state event", details)
         }
     }
 }

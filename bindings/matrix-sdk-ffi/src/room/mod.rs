@@ -778,8 +778,7 @@ impl Room {
     ///
     /// * `event_id` - The ID of the event to redact
     ///
-    /// * `reason` - The reason for the event being redacted (optional). its
-    ///   transaction ID (optional). If not given one is created.
+    /// * `reason` - The reason for the event being redacted (optional).
     pub async fn redact(
         &self,
         event_id: String,
@@ -788,6 +787,30 @@ impl Room {
         let event_id = EventId::parse(event_id)?;
         self.inner.redact(&event_id, reason.as_deref(), None).await?;
         Ok(())
+    }
+
+    /// Redacts an event from the room with a caller-provided transaction ID,
+    /// returning the homeserver event ID of the redaction event.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_id` - The ID of the event to redact.
+    ///
+    /// * `reason` - The reason for the event being redacted (optional).
+    ///
+    /// * `transaction_id` - The transaction ID to use for the redaction event.
+    pub async fn redact_with_transaction_id_returning_event_id(
+        &self,
+        event_id: String,
+        reason: Option<String>,
+        transaction_id: String,
+    ) -> Result<String, ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        let txn_id: OwnedTransactionId = transaction_id.into();
+
+        let response = self.inner.redact(&event_id, reason.as_deref(), Some(txn_id)).await?;
+
+        Ok(response.event_id.to_string())
     }
 
     pub fn active_members_count(&self) -> u64 {

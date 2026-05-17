@@ -419,6 +419,47 @@ impl From<UploadedImageError> for UploadedVoiceError {
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum UploadedVideoError {
+    #[error("validation error: {msg}")]
+    Validation { msg: String, details: Option<String> },
+    #[error("retryable error: {msg}")]
+    Retryable { msg: String, details: Option<String> },
+}
+
+impl UploadedVideoError {
+    pub(crate) fn validation<E: Display>(error: E, details: Option<String>) -> Self {
+        Self::Validation { msg: error.to_string(), details }
+    }
+
+    pub(crate) fn validation_err<E: Error>(error: E) -> Self {
+        Self::validation(error.to_string(), Some(format!("{error:?}")))
+    }
+
+    pub(crate) fn retryable<E: Display>(error: E, details: Option<String>) -> Self {
+        Self::Retryable { msg: error.to_string(), details }
+    }
+
+    pub(crate) fn retryable_err<E: Error>(error: E) -> Self {
+        Self::retryable(error.to_string(), Some(format!("{error:?}")))
+    }
+}
+
+impl From<matrix_sdk::Error> for UploadedVideoError {
+    fn from(error: matrix_sdk::Error) -> Self {
+        Self::retryable_err(error)
+    }
+}
+
+impl From<UploadedImageError> for UploadedVideoError {
+    fn from(error: UploadedImageError) -> Self {
+        match error {
+            UploadedImageError::Validation { msg, details } => Self::Validation { msg, details },
+            UploadedImageError::Retryable { msg, details } => Self::Retryable { msg, details },
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum LiveLocationError {
     #[error("Network error")]

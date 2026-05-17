@@ -85,7 +85,7 @@ use crate::{
     room_preview::RoomPreview,
     ruma::{
         AudioInfo, AudioMessageContent, FileInfo, FileMessageContent, FormattedBody, ImageInfo,
-        ImageMessageContent, MediaSource, MessageFormat, ThumbnailInfo,
+        ImageMessageContent, MediaSource, MessageFormat, MessageType, ThumbnailInfo,
         UnstableAudioDetailsContent, UnstableVoiceContent, VideoInfo, VideoMessageContent,
     },
     runtime::get_runtime_handle,
@@ -517,6 +517,42 @@ impl Room {
 
         let result =
             self.inner.send_raw(&event_type, content_json).with_transaction_id(&txn_id).await?;
+
+        Ok(result.response.event_id.to_string())
+    }
+
+    /// Send a typed `m.room.message` event with a caller-provided transaction ID,
+    /// returning the event ID from the server response.
+    ///
+    /// This bypasses the SDK send queue/local echo path while still using Ruma
+    /// typed message content built by the caller.
+    pub async fn send_message_type_with_transaction_id_returning_event_id(
+        &self,
+        msg_type: MessageType,
+        transaction_id: String,
+        reply_event_id: Option<String>,
+    ) -> Result<String, ClientError> {
+        let ruma_msg_type: RumaMessageType = msg_type.try_into()?;
+        let content_without_relation = RoomMessageEventContentWithoutRelation::new(ruma_msg_type);
+
+        let content = if let Some(reply_event_id) = reply_event_id {
+            let event_id = EventId::parse(reply_event_id)?;
+            let reply = Reply {
+                event_id,
+                enforce_thread: EnforceThread::MaybeThreaded,
+                add_mentions: AddMentions::Yes,
+            };
+
+            self.inner
+                .make_reply_event(content_without_relation, reply)
+                .await
+                .map_err(ClientError::from_err)?
+        } else {
+            RoomMessageEventContent::from(content_without_relation)
+        };
+
+        let txn_id: OwnedTransactionId = transaction_id.into();
+        let result = self.inner.send(content).with_transaction_id(txn_id).await?;
 
         Ok(result.response.event_id.to_string())
     }

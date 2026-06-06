@@ -21,7 +21,7 @@ use std::{
 };
 
 use anyhow::{Context as _, anyhow};
-use futures_util::pin_mut;
+use futures_util::{future::pending, pin_mut};
 #[cfg(feature = "sqlite")]
 use matrix_sdk::STATE_STORE_DATABASE_NAME;
 #[cfg(not(target_family = "wasm"))]
@@ -31,7 +31,10 @@ use matrix_sdk::{
     authentication::oauth::{
         ClientId, OAuthAuthorizationData, OAuthError as SdkOAuthError, OAuthSession,
     },
-    deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
+    deserialized_responses::{
+        AlgorithmInfo, EncryptionInfo, RawAnySyncOrStrippedTimelineEvent,
+        VerificationState as EventVerificationState,
+    },
     executor::AbortOnDrop,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
     ruma::{
@@ -89,7 +92,7 @@ use ruma::{
         error::ErrorKind,
     },
     events::{
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
+        AnyMessageLikeEventContent, AnySyncTimelineEvent, AnyToDeviceEvent,
         GlobalAccountDataEvent as RumaGlobalAccountDataEvent,
         RoomAccountDataEvent as RumaRoomAccountDataEvent,
         direct::DirectEventContent,
@@ -312,6 +315,54 @@ pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
 pub trait SyncNotificationListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called when a notifying event is received during sync.
     fn on_notification(&self, notification: NotificationItem, room_id: String);
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct CustomToDeviceEventEncryptionInfo {
+    pub sender: String,
+    pub sender_device: Option<String>,
+    pub sender_curve25519_key_base64: Option<String>,
+    pub sender_verified: bool,
+}
+
+impl From<&EncryptionInfo> for CustomToDeviceEventEncryptionInfo {
+    fn from(value: &EncryptionInfo) -> Self {
+        let sender_curve25519_key_base64 = match &value.algorithm_info {
+            AlgorithmInfo::OlmV1Curve25519AesSha2 { curve25519_public_key_base64 } => {
+                Some(curve25519_public_key_base64.clone())
+            }
+            AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, .. } => Some(curve25519_key.clone()),
+        };
+
+        Self {
+            sender: value.sender.to_string(),
+            sender_device: value.sender_device.as_ref().map(ToString::to_string),
+            sender_curve25519_key_base64,
+            sender_verified: matches!(value.verification_state, EventVerificationState::Verified),
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct CustomToDeviceEvent {
+    pub event_type: String,
+    pub sender: String,
+    pub content_json: String,
+    pub raw_json: String,
+    pub encryption_info: Option<CustomToDeviceEventEncryptionInfo>,
+}
+
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait CustomToDeviceEventListener: SyncOutsideWasm + SendOutsideWasm {
+    fn on_event(&self, event: CustomToDeviceEvent);
+}
+
+#[derive(Deserialize)]
+struct CustomToDeviceEventDetails {
+    #[serde(rename = "type")]
+    event_type: String,
+    sender: Option<String>,
+    content: Value,
 }
 
 #[derive(Clone, Copy, uniffi::Record)]
@@ -1370,6 +1421,78 @@ impl Client {
         let raw_content = Raw::from_json_string(content)?;
         self.inner.account().set_account_data_raw(event_type.into(), raw_content).await?;
         Ok(())
+    }
+
+    /// Listen for custom to-device events of the given type.
+    ///
+    /// If `encrypted_only` is true, plaintext to-device events are ignored.
+    /// The returned task handle keeps the event handler registered and removes
+    /// it when cancelled or dropped.
+    pub fn add_custom_to_device_event_listener(
+        &self,
+        event_type: String,
+        encrypted_only: bool,
+        listener: Box<dyn CustomToDeviceEventListener>,
+    ) -> Arc<TaskHandle> {
+        let listener: Arc<dyn CustomToDeviceEventListener> = Arc::from(listener);
+        let event_handler = self.inner.add_event_handler({
+            let event_type_filter = event_type.clone();
+
+            move |raw: Raw<AnyToDeviceEvent>, encryption_info: Option<EncryptionInfo>| {
+                let listener = listener.clone();
+                let event_type_filter = event_type_filter.clone();
+
+                async move {
+                    if encrypted_only && encryption_info.is_none() {
+                        return;
+                    }
+
+                    let raw_json = raw.json().get();
+                    let details = match serde_json::from_str::<CustomToDeviceEventDetails>(raw_json)
+                    {
+                        Ok(details) => details,
+                        Err(error) => {
+                            warn!("Failed to parse custom to-device event: {error}");
+                            return;
+                        }
+                    };
+
+                    if details.event_type != event_type_filter {
+                        return;
+                    }
+
+                    let content_json = match serde_json::to_string(&details.content) {
+                        Ok(content_json) => content_json,
+                        Err(error) => {
+                            warn!("Failed to serialize custom to-device event content: {error}");
+                            return;
+                        }
+                    };
+
+                    let encryption_info =
+                        encryption_info.as_ref().map(CustomToDeviceEventEncryptionInfo::from);
+                    let sender = details
+                        .sender
+                        .or_else(|| encryption_info.as_ref().map(|info| info.sender.clone()))
+                        .unwrap_or_default();
+
+                    listener.on_event(CustomToDeviceEvent {
+                        event_type: details.event_type,
+                        sender,
+                        content_json,
+                        raw_json: raw_json.to_owned(),
+                        encryption_info,
+                    });
+                }
+            }
+        });
+
+        let drop_guard = self.inner.event_handler_drop_guard(event_handler);
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            let _drop_guard = drop_guard;
+            pending::<()>().await;
+        })))
     }
 
     pub async fn upload_media(

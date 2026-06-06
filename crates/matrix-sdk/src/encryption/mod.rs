@@ -128,6 +128,33 @@ use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use crate::config::RequestConfig;
 pub use crate::error::RoomKeyImportError;
 
+/// The reason an encrypted raw to-device event could not be sent to a device.
+#[cfg(feature = "experimental-send-custom-to-device")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawToDeviceEventSendFailureReason {
+    /// The event was withheld by the crypto layer, for example because the
+    /// device was filtered out by the selected share strategy or because no Olm
+    /// session could be established.
+    Withheld,
+
+    /// Sending the encrypted to-device request to the homeserver failed.
+    SendFailed,
+}
+
+/// A per-device failure returned when sending an encrypted raw to-device event.
+#[cfg(feature = "experimental-send-custom-to-device")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawToDeviceEventSendFailure {
+    /// The user ID that owns the device.
+    pub user_id: OwnedUserId,
+
+    /// The device ID that did not receive the event.
+    pub device_id: OwnedDeviceId,
+
+    /// Why the event was not sent to this device.
+    pub reason: RawToDeviceEventSendFailureReason,
+}
+
 /// Error type describing failures that can happen while exporting a
 /// [`SecretsBundle`] from a SQLite store.
 #[cfg(feature = "sqlite")]
@@ -2160,6 +2187,36 @@ impl Encryption {
         content: Raw<AnyToDeviceEventContent>,
         share_strategy: CollectStrategy,
     ) -> Result<Vec<(OwnedUserId, OwnedDeviceId)>> {
+        Ok(self
+            .encrypt_and_send_raw_to_device_with_failures(
+                recipient_devices,
+                event_type,
+                content,
+                share_strategy,
+            )
+            .await?
+            .into_iter()
+            .map(|failure| (failure.user_id, failure.device_id))
+            .collect())
+    }
+
+    /// Encrypts then send the given content via the `/sendToDevice` end-point
+    /// using Olm encryption, returning per-device failure reasons.
+    ///
+    /// If there are a lot of recipient devices multiple `/sendToDevice`
+    /// requests might be sent out.
+    ///
+    /// This method only sends to the devices passed in `recipient_devices`; the
+    /// collection strategy can filter or withhold from that list, but it does
+    /// not expand it.
+    #[cfg(feature = "experimental-send-custom-to-device")]
+    pub async fn encrypt_and_send_raw_to_device_with_failures(
+        &self,
+        recipient_devices: Vec<&Device>,
+        event_type: &str,
+        content: Raw<AnyToDeviceEventContent>,
+        share_strategy: CollectStrategy,
+    ) -> Result<Vec<RawToDeviceEventSendFailure>> {
         let users = recipient_devices.iter().map(|device| device.user_id());
 
         // Will claim one-time-key for users that needs it
@@ -2181,11 +2238,15 @@ impl Encryption {
             )
             .await?;
 
-        let mut failures: Vec<(OwnedUserId, OwnedDeviceId)> = Default::default();
+        let mut failures: Vec<RawToDeviceEventSendFailure> = Default::default();
 
         // Push the withhelds in the failures
         withhelds.iter().for_each(|(d, _)| {
-            failures.push((d.user_id().to_owned(), d.device_id().to_owned()));
+            failures.push(RawToDeviceEventSendFailure {
+                user_id: d.user_id().to_owned(),
+                device_id: d.device_id().to_owned(),
+                reason: RawToDeviceEventSendFailureReason::Withheld,
+            });
         });
 
         // TODO: parallelize that? it's already grouping 250 devices per chunk.
@@ -2208,7 +2269,11 @@ impl Encryption {
                     for device_id in device_map.keys() {
                         match device_id {
                             DeviceIdOrAllDevices::DeviceId(device_id) => {
-                                failures.push((user_id.clone(), device_id.to_owned()));
+                                failures.push(RawToDeviceEventSendFailure {
+                                    user_id: user_id.clone(),
+                                    device_id: device_id.to_owned(),
+                                    reason: RawToDeviceEventSendFailureReason::SendFailed,
+                                });
                             }
                             DeviceIdOrAllDevices::AllDevices => {
                                 // Cannot happen in this case

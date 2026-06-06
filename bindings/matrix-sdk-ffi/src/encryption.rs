@@ -16,9 +16,12 @@ use std::{str::FromStr, sync::Arc};
 
 use futures_util::StreamExt;
 use matrix_sdk::encryption::{self, backups, recovery};
-use matrix_sdk_base::crypto::types::{BackupSecrets, RoomKeyBackupInfo};
+use matrix_sdk_base::crypto::{
+    CollectStrategy,
+    types::{BackupSecrets, RoomKeyBackupInfo},
+};
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
-use ruma::OwnedUserId;
+use ruma::{OwnedDeviceId, OwnedUserId, UserId, events::AnyToDeviceEventContent, serde::Raw};
 use serde::de::Error;
 use thiserror::Error;
 use tracing::{error, info};
@@ -234,6 +237,74 @@ impl From<encryption::VerificationState> for VerificationState {
             encryption::VerificationState::Unknown => Self::Unknown,
             encryption::VerificationState::Verified => Self::Verified,
             encryption::VerificationState::Unverified => Self::Unverified,
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct ToDeviceTarget {
+    pub user_id: String,
+    pub device_id: String,
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum CustomToDeviceEventSendFailureReason {
+    MissingDevice,
+    Withheld,
+    SendFailed,
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct CustomToDeviceEventSendFailure {
+    pub user_id: String,
+    pub device_id: String,
+    pub reason: CustomToDeviceEventSendFailureReason,
+}
+
+impl From<matrix_sdk::encryption::RawToDeviceEventSendFailure> for CustomToDeviceEventSendFailure {
+    fn from(value: matrix_sdk::encryption::RawToDeviceEventSendFailure) -> Self {
+        let reason = match value.reason {
+            matrix_sdk::encryption::RawToDeviceEventSendFailureReason::Withheld => {
+                CustomToDeviceEventSendFailureReason::Withheld
+            }
+            matrix_sdk::encryption::RawToDeviceEventSendFailureReason::SendFailed => {
+                CustomToDeviceEventSendFailureReason::SendFailed
+            }
+        };
+
+        Self { user_id: value.user_id.to_string(), device_id: value.device_id.to_string(), reason }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct DeviceInfo {
+    pub user_id: String,
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub curve25519_key: Option<String>,
+    pub ed25519_key: Option<String>,
+    pub is_verified: bool,
+    pub is_verified_with_cross_signing: bool,
+    pub is_cross_signed_by_owner: bool,
+    pub is_locally_trusted: bool,
+    pub is_blacklisted: bool,
+    pub is_deleted: bool,
+}
+
+impl From<&matrix_sdk::encryption::identities::Device> for DeviceInfo {
+    fn from(device: &matrix_sdk::encryption::identities::Device) -> Self {
+        Self {
+            user_id: device.user_id().to_string(),
+            device_id: device.device_id().to_string(),
+            display_name: device.display_name().map(ToOwned::to_owned),
+            curve25519_key: device.curve25519_key().map(|key| key.to_base64()),
+            ed25519_key: device.ed25519_key().map(|key| key.to_base64()),
+            is_verified: device.is_verified(),
+            is_verified_with_cross_signing: device.is_verified_with_cross_signing(),
+            is_cross_signed_by_owner: device.is_cross_signed_by_owner(),
+            is_locally_trusted: device.is_locally_trusted(),
+            is_blacklisted: device.is_blacklisted(),
+            is_deleted: device.is_deleted(),
         }
     }
 }
@@ -469,6 +540,74 @@ impl Encryption {
     /// usually what is called the identity key of the device.
     pub async fn curve25519_key(&self) -> Option<String> {
         self.inner.curve25519_key().await.map(|k| k.to_base64())
+    }
+
+    /// Encrypt and send raw custom to-device event content to the exact target
+    /// devices.
+    ///
+    /// The `content_json` parameter must be a JSON object representing the
+    /// plaintext content of the custom to-device event.
+    pub async fn encrypt_and_send_raw_to_device(
+        &self,
+        event_type: String,
+        targets: Vec<ToDeviceTarget>,
+        content_json: String,
+    ) -> Result<Vec<CustomToDeviceEventSendFailure>, ClientError> {
+        let mut failures = Vec::new();
+        let mut recipient_devices = Vec::new();
+
+        for target in targets {
+            let user_id = UserId::parse(&target.user_id)?;
+            let device_id = OwnedDeviceId::from(target.device_id.as_str());
+
+            if let Some(device) = self.inner.get_device(&user_id, &device_id).await? {
+                recipient_devices.push(device);
+            } else {
+                failures.push(CustomToDeviceEventSendFailure {
+                    user_id: target.user_id,
+                    device_id: target.device_id,
+                    reason: CustomToDeviceEventSendFailureReason::MissingDevice,
+                });
+            }
+        }
+
+        if !recipient_devices.is_empty() {
+            let content: Raw<AnyToDeviceEventContent> = Raw::from_json_string(content_json)?;
+
+            let send_failures = self
+                .inner
+                .encrypt_and_send_raw_to_device_with_failures(
+                    recipient_devices.iter().collect(),
+                    &event_type,
+                    content,
+                    CollectStrategy::AllDevices,
+                )
+                .await?;
+
+            failures.extend(send_failures.into_iter().map(CustomToDeviceEventSendFailure::from));
+        }
+
+        Ok(failures)
+    }
+
+    /// Get device information from the crypto store.
+    pub async fn get_device(
+        &self,
+        user_id: String,
+        device_id: String,
+    ) -> Result<Option<DeviceInfo>, ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        let device_id = OwnedDeviceId::from(device_id.as_str());
+
+        Ok(self.inner.get_device(&user_id, &device_id).await?.map(|device| (&device).into()))
+    }
+
+    /// Get all known devices for a user from the crypto store.
+    pub async fn get_user_devices(&self, user_id: String) -> Result<Vec<DeviceInfo>, ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        let devices = self.inner.get_user_devices(&user_id).await?;
+
+        Ok(devices.devices().map(|device| DeviceInfo::from(&device)).collect())
     }
 
     pub fn backup_state_listener(&self, listener: Box<dyn BackupStateListener>) -> Arc<TaskHandle> {

@@ -52,6 +52,7 @@ log-panics = { version = "2.1.0", default-features = false, features = ["with-ba
 matrix-sdk = { workspace = true, features = [
     "anyhow",
     "e2e-encryption",
+    "experimental-send-custom-to-device",
     "experimental-widgets",
     "markdown",
     "socks",

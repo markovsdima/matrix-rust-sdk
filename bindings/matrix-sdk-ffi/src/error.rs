@@ -236,6 +236,163 @@ impl From<spaces::Error> for ClientError {
     }
 }
 
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum DelayedEventError {
+    #[error("homeserver does not support delayed events")]
+    DelayedEventsUnsupported,
+    #[error("delayed event not found")]
+    NotFound,
+    #[error("rate limited")]
+    RateLimited { retry_after_ms: Option<u64> },
+    #[error("requested delay exceeds server maximum")]
+    MaxDelayExceeded { max_delay_ms: Option<u64> },
+    #[error("delayed event error: {msg}")]
+    Generic { msg: String, details: Option<String> },
+}
+
+impl DelayedEventError {
+    pub(crate) fn generic<E: Display>(error: E, details: Option<String>) -> Self {
+        Self::Generic { msg: error.to_string(), details }
+    }
+
+    pub(crate) fn from_err<E: Error>(error: E) -> Self {
+        let details = Some(format!("{error:?}"));
+        Self::generic(error, details)
+    }
+
+    pub(crate) fn unsupported() -> Self {
+        Self::DelayedEventsUnsupported
+    }
+
+    fn from_client_api_error(api_error: &ruma::api::error::Error) -> Self {
+        if let Some(error) = Self::max_delay_exceeded_from_body(&api_error.body) {
+            return error;
+        }
+
+        match api_error.error_kind() {
+            Some(RumaApiErrorKind::NotFound) => Self::NotFound,
+            Some(RumaApiErrorKind::Unrecognized) => Self::DelayedEventsUnsupported,
+            Some(RumaApiErrorKind::LimitExceeded(limit_exceeded)) => Self::RateLimited {
+                retry_after_ms: retry_after_ms(limit_exceeded.retry_after.as_ref()),
+            },
+            _ => Self::Generic {
+                msg: api_error_message(api_error),
+                details: Some(format!("{api_error:?}")),
+            },
+        }
+    }
+
+    pub(crate) fn from_raw_client_api_error(
+        status_code: ruma::exports::http::StatusCode,
+        headers: &ruma::exports::http::HeaderMap,
+        body: &[u8],
+    ) -> Self {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
+            && let Some(error) = Self::max_delay_exceeded_from_value(&value)
+        {
+            return error;
+        }
+
+        let mut response = ruma::exports::http::Response::builder().status(status_code);
+        for (name, value) in headers {
+            response = response.header(name, value);
+        }
+
+        let response = response.body(body).expect("response with status and body should be valid");
+        let api_error =
+            <ruma::api::error::Error as ruma::api::EndpointError>::from_http_response(response);
+        Self::from_client_api_error(&api_error)
+    }
+
+    fn max_delay_exceeded_from_body(body: &ErrorBody) -> Option<Self> {
+        let ErrorBody::Json(value) = body else {
+            return None;
+        };
+
+        Self::max_delay_exceeded_from_value(value)
+    }
+
+    fn max_delay_exceeded_from_value(value: &serde_json::Value) -> Option<Self> {
+        let errcode = value.get("errcode")?.as_str()?;
+        if errcode != "M_UNKNOWN" {
+            return None;
+        }
+
+        let msc4140_errcode = value.get("org.matrix.msc4140.errcode")?.as_str()?;
+        if msc4140_errcode != "M_MAX_DELAY_EXCEEDED" {
+            return None;
+        }
+
+        let max_delay_ms =
+            value.get("org.matrix.msc4140.max_delay").and_then(|value| value.as_u64());
+        Some(Self::MaxDelayExceeded { max_delay_ms })
+    }
+}
+
+impl From<matrix_sdk::Error> for DelayedEventError {
+    fn from(error: matrix_sdk::Error) -> Self {
+        match error {
+            matrix_sdk::Error::Http(http_error) => (*http_error).into(),
+            _ => Self::from_err(error),
+        }
+    }
+}
+
+impl From<HttpError> for DelayedEventError {
+    fn from(error: HttpError) -> Self {
+        if let Some(api_error) = error.as_client_api_error() {
+            return Self::from_client_api_error(api_error);
+        }
+
+        Self::from_err(error)
+    }
+}
+
+impl From<IdParseError> for DelayedEventError {
+    fn from(error: IdParseError) -> Self {
+        Self::from_err(error)
+    }
+}
+
+impl From<serde_json::Error> for DelayedEventError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::from_err(error)
+    }
+}
+
+impl From<ruma::api::error::IntoHttpError> for DelayedEventError {
+    fn from(error: ruma::api::error::IntoHttpError) -> Self {
+        Self::from_err(error)
+    }
+}
+
+impl From<reqwest::Error> for DelayedEventError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::from_err(error)
+    }
+}
+
+fn retry_after_ms(retry_after: Option<&RetryAfter>) -> Option<u64> {
+    match retry_after {
+        Some(RetryAfter::Delay(duration)) => Some(duration.as_millis() as u64),
+        Some(RetryAfter::DateTime(system_time)) => {
+            let duration = MilliSecondsSinceUnixEpoch::now()
+                .to_system_time()
+                .and_then(|now| system_time.duration_since(now).ok());
+            duration.map(|duration| duration.as_millis() as u64)
+        }
+        None => None,
+    }
+}
+
+fn api_error_message(api_error: &ruma::api::error::Error) -> String {
+    match &api_error.body {
+        ErrorBody::Standard(StandardErrorBody { message, .. }) => message.clone(),
+        ErrorBody::Json(value) => value.to_string(),
+        ErrorBody::NotJson { .. } => api_error.to_string(),
+    }
+}
+
 /// Bindings version of the sdk type replacing OwnedUserId/DeviceIds with simple
 /// String.
 ///
@@ -1034,5 +1191,135 @@ impl TryFrom<RumaApiErrorKind> for ErrorKind {
             // In any other case, return it as the mapping not being yet implemented
             _ => Err(NotYetImplemented),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use ruma::{
+        api::error::{
+            Error as RumaApiError, ErrorBody, ErrorKind as RumaApiErrorKind,
+            LimitExceededErrorData, RetryAfter, StandardErrorBody,
+        },
+        exports::http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
+    };
+    use serde_json::json;
+
+    use super::DelayedEventError;
+
+    fn standard_api_error(
+        status_code: StatusCode,
+        kind: RumaApiErrorKind,
+        message: &str,
+    ) -> RumaApiError {
+        RumaApiError::new(
+            status_code,
+            ErrorBody::Standard(StandardErrorBody::new(kind, message.to_owned())),
+        )
+    }
+
+    #[test]
+    fn test_delayed_event_error_maps_not_found() {
+        let error = standard_api_error(
+            StatusCode::NOT_FOUND,
+            RumaApiErrorKind::NotFound,
+            "Delayed event not found",
+        );
+
+        assert!(matches!(
+            DelayedEventError::from_client_api_error(&error),
+            DelayedEventError::NotFound
+        ));
+    }
+
+    #[test]
+    fn test_delayed_event_error_maps_unrecognized_to_unsupported() {
+        let error = standard_api_error(
+            StatusCode::NOT_FOUND,
+            RumaApiErrorKind::Unrecognized,
+            "Unrecognized request",
+        );
+
+        assert!(matches!(
+            DelayedEventError::from_client_api_error(&error),
+            DelayedEventError::DelayedEventsUnsupported
+        ));
+    }
+
+    #[test]
+    fn test_delayed_event_error_maps_rate_limit_retry_after() {
+        let mut limit_exceeded = LimitExceededErrorData::new();
+        limit_exceeded.retry_after = Some(RetryAfter::Delay(Duration::from_millis(1500)));
+
+        let error = standard_api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            RumaApiErrorKind::LimitExceeded(limit_exceeded),
+            "Rate limited",
+        );
+
+        assert!(matches!(
+            DelayedEventError::from_client_api_error(&error),
+            DelayedEventError::RateLimited { retry_after_ms: Some(1500) }
+        ));
+    }
+
+    #[test]
+    fn test_delayed_event_error_maps_max_delay_exceeded() {
+        let error = RumaApiError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorBody::Json(json!({
+                "errcode": "M_UNKNOWN",
+                "error": "Maximum delay exceeded",
+                "org.matrix.msc4140.errcode": "M_MAX_DELAY_EXCEEDED",
+                "org.matrix.msc4140.max_delay": 30_000,
+            })),
+        );
+
+        assert!(matches!(
+            DelayedEventError::from_client_api_error(&error),
+            DelayedEventError::MaxDelayExceeded { max_delay_ms: Some(30_000) }
+        ));
+    }
+
+    #[test]
+    fn test_delayed_event_error_maps_max_delay_exceeded_from_raw_standard_body() {
+        let body = serde_json::to_vec(&json!({
+            "errcode": "M_UNKNOWN",
+            "error": "Maximum delay exceeded",
+            "org.matrix.msc4140.errcode": "M_MAX_DELAY_EXCEEDED",
+            "org.matrix.msc4140.max_delay": 7500,
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            DelayedEventError::from_raw_client_api_error(
+                StatusCode::BAD_REQUEST,
+                &HeaderMap::new(),
+                &body
+            ),
+            DelayedEventError::MaxDelayExceeded { max_delay_ms: Some(7500) }
+        ));
+    }
+
+    #[test]
+    fn test_delayed_event_error_maps_rate_limit_retry_after_from_raw_headers() {
+        let body = serde_json::to_vec(&json!({
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "Rate limited",
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+
+        assert!(matches!(
+            DelayedEventError::from_raw_client_api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                &body
+            ),
+            DelayedEventError::RateLimited { retry_after_ms: Some(2000) }
+        ));
     }
 }

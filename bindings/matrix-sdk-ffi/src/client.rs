@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt::Debug,
     path::PathBuf,
@@ -37,21 +38,32 @@ use matrix_sdk::{
     },
     executor::AbortOnDrop,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
+    reqwest,
     ruma::{
         EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
-        api::client::{
-            account::request_openid_token,
-            discovery::{
-                discover_homeserver::RtcFocusInfo,
-                get_authorization_server_metadata::v1::Prompt as RumaOAuthPrompt,
+        api::{
+            MatrixVersion, OutgoingRequest, SupportedVersions,
+            auth_scheme::SendAccessToken,
+            client::{
+                account::request_openid_token,
+                delayed_events::{
+                    DelayParameters, delayed_state_event,
+                    update_delayed_event::unstable::{
+                        Request as UpdateDelayedEventRequest, UpdateAction,
+                    },
+                },
+                discovery::{
+                    discover_homeserver::RtcFocusInfo,
+                    get_authorization_server_metadata::v1::Prompt as RumaOAuthPrompt,
+                },
+                push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
+                room::{Visibility, create_room},
+                session::get_login_types,
+                user_directory::search_users,
             },
-            push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
-            room::{Visibility, create_room},
-            session::get_login_types,
-            user_directory::search_users,
         },
         events::{
-            AnyInitialStateEvent, InitialStateEvent,
+            AnyInitialStateEvent, AnyStateEventContent, InitialStateEvent, StateEventType,
             room::{
                 avatar::RoomAvatarEventContent, encryption::RoomEncryptionEventContent,
                 message::MessageType,
@@ -134,6 +146,7 @@ use crate::{
     },
     client,
     encryption::Encryption,
+    error::DelayedEventError,
     live_locations_observer::BeaconInfoUpdate,
     notification::{
         NotificationClient, NotificationEvent, NotificationItem, NotificationRoomInfo,
@@ -1136,6 +1149,47 @@ impl Client {
     /// it.
     pub async fn reset_well_known(&self) -> Result<(), ClientError> {
         Ok(self.inner.reset_well_known().await?)
+    }
+
+    /// Schedule a raw state event to be sent later using MSC4140 delayed
+    /// events.
+    ///
+    /// This is a generic transport API. MatrixRTC callers are expected to pass
+    /// the MatrixRTC membership state event type, state key, and content.
+    pub async fn schedule_delayed_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: String,
+        content_json: String,
+        delay_ms: u64,
+    ) -> Result<String, DelayedEventError> {
+        ensure_delayed_events_supported(&self.inner).await?;
+
+        let request = delayed_state_event::unstable::Request::new_raw(
+            RoomId::parse(room_id)?,
+            state_key,
+            StateEventType::from(event_type),
+            DelayParameters::Timeout { timeout: Duration::from_millis(delay_ms) },
+            Raw::<AnyStateEventContent>::from_json_string(content_json)?,
+        );
+
+        send_delayed_state_event(&self.inner, request).await
+    }
+
+    /// Restart the timeout for a scheduled delayed event.
+    pub async fn restart_delayed_event(&self, delay_id: String) -> Result<(), DelayedEventError> {
+        update_delayed_event(&self.inner, delay_id, UpdateAction::Restart).await
+    }
+
+    /// Send a scheduled delayed event immediately.
+    pub async fn send_delayed_event(&self, delay_id: String) -> Result<(), DelayedEventError> {
+        update_delayed_event(&self.inner, delay_id, UpdateAction::Send).await
+    }
+
+    /// Cancel a scheduled delayed event.
+    pub async fn cancel_delayed_event(&self, delay_id: String) -> Result<(), DelayedEventError> {
+        update_delayed_event(&self.inner, delay_id, UpdateAction::Cancel).await
     }
 
     /// Retrieves a media file from the media source
@@ -3401,6 +3455,67 @@ impl HomeserverCapabilities {
     }
 }
 
+async fn ensure_delayed_events_supported(client: &MatrixClient) -> Result<(), DelayedEventError> {
+    let unstable_features = client.unstable_features().await.map_err(DelayedEventError::from)?;
+
+    if unstable_features.contains(&ruma::api::FeatureFlag::from("org.matrix.msc4140")) {
+        Ok(())
+    } else {
+        Err(DelayedEventError::unsupported())
+    }
+}
+
+async fn send_delayed_state_event(
+    client: &MatrixClient,
+    request: delayed_state_event::unstable::Request,
+) -> Result<String, DelayedEventError> {
+    let homeserver = client.homeserver().to_string();
+    let access_token = client.access_token();
+    let send_access_token =
+        access_token.as_deref().map_or(SendAccessToken::None, SendAccessToken::IfRequired);
+    let supported_versions = Cow::Owned(SupportedVersions {
+        versions: [MatrixVersion::V1_1].into(),
+        features: Default::default(),
+    });
+
+    let request = request.try_into_http_request::<Vec<u8>>(
+        &homeserver,
+        send_access_token,
+        supported_versions,
+    )?;
+    let request = reqwest::Request::try_from(request.map(reqwest::Body::from))
+        .map_err(DelayedEventError::from_err)?;
+
+    let response = client.http_client().execute(request).await?;
+    let status_code = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes().await?;
+
+    if !status_code.is_success() {
+        return Err(DelayedEventError::from_raw_client_api_error(status_code, &headers, &body));
+    }
+
+    #[derive(Deserialize)]
+    struct Response {
+        delay_id: String,
+    }
+
+    Ok(serde_json::from_slice::<Response>(&body)?.delay_id)
+}
+
+async fn update_delayed_event(
+    client: &MatrixClient,
+    delay_id: String,
+    action: UpdateAction,
+) -> Result<(), DelayedEventError> {
+    ensure_delayed_events_supported(client).await?;
+
+    let request = UpdateDelayedEventRequest::new(delay_id, action);
+    client.send(request).await.map_err(DelayedEventError::from)?;
+
+    Ok(())
+}
+
 #[derive(uniffi::Record)]
 pub struct ExtendedProfileFields {
     pub enabled: bool,
@@ -3410,8 +3525,13 @@ pub struct ExtendedProfileFields {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use matrix_sdk::{
+        store::{MemoryStore, StoreConfig},
+        test_utils::mocks::MatrixMockServer,
+    };
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use ruma::{
         ServerName,
         api::client::room::{Visibility, create_room},
@@ -3419,11 +3539,139 @@ mod tests {
         events::StateEventType,
         room::RoomType,
     };
+    use serde_json::json;
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{body_json, method, path_regex, query_param},
+    };
 
     use crate::{
-        client::{CreateRoomParameters, JoinRule, OpenIdToken, RoomPreset, RoomVisibility},
+        client::{Client, CreateRoomParameters, JoinRule, OpenIdToken, RoomPreset, RoomVisibility},
+        error::DelayedEventError,
         room::RoomHistoryVisibility,
     };
+
+    async fn delayed_events_test_client() -> (Client, MatrixMockServer) {
+        let mock_server = MatrixMockServer::new().await;
+
+        mock_server.mock_versions().with_feature("org.matrix.msc4140", true).ok().mount().await;
+
+        let memory_store = Arc::new(MemoryStore::new());
+        let sdk_client = mock_server
+            .client_builder()
+            .no_server_versions()
+            .on_builder(|builder| {
+                builder
+                    .cross_process_store_config(CrossProcessLockConfig::SingleProcess)
+                    .store_config(
+                        StoreConfig::new(CrossProcessLockConfig::SingleProcess)
+                            .state_store(memory_store.clone()),
+                    )
+            })
+            .build()
+            .await;
+        let client =
+            Client::new(sdk_client, None, None).await.expect("FFI client should be created");
+
+        (client, mock_server)
+    }
+
+    #[tokio::test]
+    async fn test_schedule_delayed_state_event_sends_raw_matrixrtc_membership_leave() {
+        let (client, mock_server) = delayed_events_test_client().await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/!matrixrtc:example.org/state/org\.matrix\.msc3401\.call\.member/_@alice:example\.org_DEVICE_m\.call$",
+            ))
+            .and(query_param("org.matrix.msc4140.delay", "8000"))
+            .and(body_json(json!({})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "delay_id": "delay-123" })),
+            )
+            .expect(1)
+            .mount(mock_server.server())
+            .await;
+
+        let delay_id = client
+            .schedule_delayed_state_event(
+                "!matrixrtc:example.org".to_owned(),
+                "org.matrix.msc3401.call.member".to_owned(),
+                "_@alice:example.org_DEVICE_m.call".to_owned(),
+                "{}".to_owned(),
+                8000,
+            )
+            .await
+            .expect("delayed state event should be scheduled");
+
+        assert_eq!(delay_id, "delay-123");
+    }
+
+    #[tokio::test]
+    async fn test_schedule_delayed_state_event_maps_max_delay_exceeded() {
+        let (client, mock_server) = delayed_events_test_client().await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/!matrixrtc:example.org/state/org\.matrix\.msc3401\.call\.member/_@alice:example\.org_DEVICE_m\.call$",
+            ))
+            .and(query_param("org.matrix.msc4140.delay", "8000"))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "errcode": "M_UNKNOWN",
+                "error": "Maximum delay exceeded",
+                "org.matrix.msc4140.errcode": "M_MAX_DELAY_EXCEEDED",
+                "org.matrix.msc4140.max_delay": 7500,
+            })))
+            .expect(1)
+            .mount(mock_server.server())
+            .await;
+
+        let error = client
+            .schedule_delayed_state_event(
+                "!matrixrtc:example.org".to_owned(),
+                "org.matrix.msc3401.call.member".to_owned(),
+                "_@alice:example.org_DEVICE_m.call".to_owned(),
+                "{}".to_owned(),
+                8000,
+            )
+            .await
+            .expect_err("delayed state event should exceed the server max delay");
+
+        assert!(matches!(error, DelayedEventError::MaxDelayExceeded { max_delay_ms: Some(7500) }));
+    }
+
+    #[tokio::test]
+    async fn test_delayed_event_updates_send_expected_actions() {
+        let (client, mock_server) = delayed_events_test_client().await;
+
+        for (delay_id, action) in
+            [("delay-restart", "restart"), ("delay-send", "send"), ("delay-cancel", "cancel")]
+        {
+            Mock::given(method("POST"))
+                .and(path_regex(format!(
+                    r"^/_matrix/client/unstable/org\.matrix\.msc4140/delayed_events/{delay_id}$"
+                )))
+                .and(body_json(json!({ "action": action })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(mock_server.server())
+                .await;
+        }
+
+        client
+            .restart_delayed_event("delay-restart".to_owned())
+            .await
+            .expect("delayed event should restart");
+        client
+            .send_delayed_event("delay-send".to_owned())
+            .await
+            .expect("delayed event should send");
+        client
+            .cancel_delayed_event("delay-cancel".to_owned())
+            .await
+            .expect("delayed event should cancel");
+    }
 
     #[test]
     fn test_create_room_parameters_mapping() {

@@ -135,6 +135,7 @@ jvm-getter = "0.1.0"
 
 [dev-dependencies]
 matrix-sdk = { workspace = true, features = ["testing"] }
+matrix-sdk-test.workspace = true
 similar-asserts.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true

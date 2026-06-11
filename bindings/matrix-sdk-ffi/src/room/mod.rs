@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
+    future::pending,
     io::Cursor,
     path::{Path, PathBuf},
     pin::pin,
@@ -29,9 +30,12 @@ use matrix_sdk::{
     DraftAttachment as SdkDraftAttachment, DraftAttachmentContent, DraftThumbnail, EncryptionState,
     PredecessorRoom as SdkPredecessorRoom, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
     SuccessorRoom as SdkSuccessorRoom,
+    deserialized_responses::{
+        AlgorithmInfo, EncryptionInfo, VerificationState as EventVerificationState,
+    },
     encryption::LocalTrust,
     room::{
-        Room as SdkRoom, RoomMemberRole,
+        IncludeRelations, RelationsOptions, Room as SdkRoom, RoomMemberRole,
         edit::EditedContent,
         power_levels::RoomPowerLevelChanges,
         reply::{EnforceThread, Reply, ReplyError},
@@ -46,10 +50,13 @@ use matrix_sdk_ui::{
 use mime::Mime;
 use ruma::{
     EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedTransactionId,
-    OwnedUserId, RoomAliasId, ServerName, UInt, UserId, assign,
+    OwnedUserId, RoomAliasId, ServerName, UInt, UserId,
+    api::Direction,
+    assign,
     events::{
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
+        AnyMessageLikeEventContent, AnySyncTimelineEvent, TimelineEventType,
         receipt::ReceiptThread,
+        relation::RelationType,
         room::{
             MediaSource as RumaMediaSource,
             avatar::ImageInfo as RumaAvatarImageInfo,
@@ -65,9 +72,11 @@ use ruma::{
             },
         },
     },
+    serde::Raw,
 };
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use serde_json::Value;
+use tracing::{error, warn};
 
 use self::{power_levels::RoomPowerLevels, room_info::RoomInfo};
 use crate::{
@@ -131,6 +140,112 @@ impl Room {
     pub(crate) fn new(inner: SdkRoom, utd_hook_manager: Option<Arc<UtdHookManager>>) -> Self {
         Room { inner, utd_hook_manager }
     }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct RawRoomEventEncryptionInfo {
+    pub sender: String,
+    pub sender_device: Option<String>,
+    pub sender_curve25519_key_base64: Option<String>,
+    pub sender_verified: bool,
+}
+
+impl From<&EncryptionInfo> for RawRoomEventEncryptionInfo {
+    fn from(value: &EncryptionInfo) -> Self {
+        let sender_curve25519_key_base64 = match &value.algorithm_info {
+            AlgorithmInfo::OlmV1Curve25519AesSha2 { curve25519_public_key_base64 } => {
+                Some(curve25519_public_key_base64.clone())
+            }
+            AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, .. } => Some(curve25519_key.clone()),
+        };
+
+        Self {
+            sender: value.sender.to_string(),
+            sender_device: value.sender_device.as_ref().map(ToString::to_string),
+            sender_curve25519_key_base64,
+            sender_verified: matches!(value.verification_state, EventVerificationState::Verified),
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct RawRoomEvent {
+    pub room_id: String,
+    pub event_type: String,
+    pub event_id: Option<String>,
+    pub sender: Option<String>,
+    pub origin_server_ts_ms: Option<u64>,
+    pub content_json: String,
+    pub raw_json: String,
+    pub encryption_info: Option<RawRoomEventEncryptionInfo>,
+}
+
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait RawRoomEventListener: SyncOutsideWasm + SendOutsideWasm {
+    fn on_event(&self, event: RawRoomEvent);
+}
+
+#[derive(Deserialize)]
+struct RawRoomEventDetails {
+    #[serde(rename = "type")]
+    event_type: String,
+    event_id: Option<String>,
+    sender: Option<String>,
+    origin_server_ts: Option<u64>,
+    content: Value,
+}
+
+fn raw_room_event_from_raw_json(
+    room_id: String,
+    raw_json: &str,
+    encryption_info: Option<RawRoomEventEncryptionInfo>,
+) -> serde_json::Result<RawRoomEvent> {
+    let details = serde_json::from_str::<RawRoomEventDetails>(raw_json)?;
+    let content_json = serde_json::to_string(&details.content)?;
+
+    Ok(RawRoomEvent {
+        room_id,
+        event_type: details.event_type,
+        event_id: details.event_id,
+        sender: details.sender,
+        origin_server_ts_ms: details.origin_server_ts,
+        content_json,
+        raw_json: raw_json.to_owned(),
+        encryption_info,
+    })
+}
+
+#[derive(Clone, Copy, uniffi::Enum)]
+pub enum RawRoomRelationsDirection {
+    Backward,
+    Forward,
+}
+
+impl From<RawRoomRelationsDirection> for Direction {
+    fn from(value: RawRoomRelationsDirection) -> Self {
+        match value {
+            RawRoomRelationsDirection::Backward => Direction::Backward,
+            RawRoomRelationsDirection::Forward => Direction::Forward,
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct RawRoomRelationsOptions {
+    pub relation_type: Option<String>,
+    pub event_type: Option<String>,
+    pub from: Option<String>,
+    pub limit: Option<u64>,
+    pub direction: RawRoomRelationsDirection,
+    pub recurse: bool,
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct RawRoomRelations {
+    pub chunk: Vec<RawRoomEvent>,
+    pub prev_batch_token: Option<String>,
+    pub next_batch_token: Option<String>,
+    pub recursion_depth: Option<u64>,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -318,6 +433,149 @@ impl Room {
         let timeline = builder.build().await?;
 
         Ok(Timeline::new(timeline))
+    }
+
+    /// Listen for live raw timeline events in this room, filtered by event type.
+    ///
+    /// This bypasses the UI timeline item model, so relation events such as
+    /// `m.reaction` and `m.room.redaction` can be observed even when they are
+    /// aggregated into other timeline items.
+    ///
+    /// The returned task handle keeps the event handler registered and removes
+    /// it when cancelled or dropped.
+    pub fn subscribe_to_raw_timeline_events(
+        &self,
+        event_types: Vec<String>,
+        listener: Box<dyn RawRoomEventListener>,
+    ) -> Arc<TaskHandle> {
+        let event_types = Arc::new(event_types.into_iter().collect::<HashSet<_>>());
+        let listener: Arc<dyn RawRoomEventListener> = Arc::from(listener);
+        let room_id: Arc<str> = self.inner.room_id().as_str().into();
+
+        let event_handler = self.inner.add_event_handler({
+            move |raw: Raw<AnySyncTimelineEvent>, encryption_info: Option<EncryptionInfo>| {
+                let event_types = event_types.clone();
+                let listener = listener.clone();
+                let room_id = room_id.clone();
+
+                async move {
+                    let event_type = match raw.get_field::<String>("type") {
+                        Ok(Some(event_type)) => event_type,
+                        Ok(None) => {
+                            warn!("Raw room event is missing an event type");
+                            return;
+                        }
+                        Err(error) => {
+                            warn!("Failed to parse raw room event type: {error}");
+                            return;
+                        }
+                    };
+
+                    if !event_types.contains(&event_type) {
+                        return;
+                    }
+
+                    let encryption_info =
+                        encryption_info.as_ref().map(RawRoomEventEncryptionInfo::from);
+                    let raw_json = raw.json().get();
+                    let event = match raw_room_event_from_raw_json(
+                        room_id.to_string(),
+                        raw_json,
+                        encryption_info,
+                    ) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            warn!("Failed to parse raw room event: {error}");
+                            return;
+                        }
+                    };
+
+                    listener.on_event(event);
+                }
+            }
+        });
+
+        let drop_guard = self.inner.client().event_handler_drop_guard(event_handler);
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            let _drop_guard = drop_guard;
+            pending::<()>().await;
+        })))
+    }
+
+    /// Retrieve raw room events related to a given event, using the Matrix
+    /// relations API.
+    ///
+    /// This is useful to backfill relation events such as `m.reaction` events
+    /// for a MatrixRTC membership event without going through the UI timeline
+    /// aggregation model.
+    pub async fn get_event_relations(
+        &self,
+        event_id: String,
+        options: RawRoomRelationsOptions,
+    ) -> Result<RawRoomRelations, ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        let include_relations = match (options.relation_type, options.event_type) {
+            (None, None) => IncludeRelations::AllRelations,
+            (Some(relation_type), None) => {
+                IncludeRelations::RelationsOfType(RelationType::from(relation_type.as_str()))
+            }
+            (Some(relation_type), Some(event_type)) => {
+                IncludeRelations::RelationsOfTypeAndEventType(
+                    RelationType::from(relation_type.as_str()),
+                    TimelineEventType::from(event_type.as_str()),
+                )
+            }
+            (None, Some(event_type)) => {
+                return Err(ClientError::Generic {
+                    msg: "event_type requires relation_type when querying room relations"
+                        .to_owned(),
+                    details: Some(format!("event_type={event_type}")),
+                });
+            }
+        };
+        let limit = options
+            .limit
+            .map(|limit| {
+                UInt::new(limit).ok_or_else(|| ClientError::Generic {
+                    msg: "relations limit is too large".to_owned(),
+                    details: Some(format!("limit={limit}")),
+                })
+            })
+            .transpose()?;
+
+        let relations = self
+            .inner
+            .relations(
+                event_id,
+                RelationsOptions {
+                    from: options.from,
+                    dir: options.direction.into(),
+                    limit,
+                    include_relations,
+                    recurse: options.recurse,
+                },
+            )
+            .await?;
+
+        let room_id = self.inner.room_id().to_string();
+        let mut chunk = Vec::with_capacity(relations.chunk.len());
+        for event in relations.chunk {
+            let raw_json = event.raw().json().get();
+            let encryption_info =
+                event.encryption_info().map(|info| RawRoomEventEncryptionInfo::from(info.as_ref()));
+            chunk.push(
+                raw_room_event_from_raw_json(room_id.clone(), raw_json, encryption_info)
+                    .map_err(ClientError::from_err)?,
+            );
+        }
+
+        Ok(RawRoomRelations {
+            chunk,
+            prev_batch_token: relations.prev_batch_token,
+            next_batch_token: relations.next_batch_token,
+            recursion_depth: relations.recursion_depth.map(Into::into),
+        })
     }
 
     pub fn id(&self) -> String {
@@ -3553,5 +3811,268 @@ impl TryFrom<SdkRoomSendQueueUpdate> for RoomSendQueueUpdate {
                 Self::SentEvent { transaction_id: transaction_id.into(), event_id: event_id.into() }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    use matrix_sdk::{
+        deserialized_responses::{
+            AlgorithmInfo, EncryptionInfo, VerificationLevel,
+            VerificationState as EventVerificationState,
+        },
+        room::IncludeRelations,
+        test_utils::mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
+    };
+    use matrix_sdk_test::{JoinedRoomBuilder, event_factory::EventFactory};
+    use ruma::{
+        DeviceKeyAlgorithm, event_id,
+        events::{AnySyncTimelineEvent, TimelineEventType, relation::RelationType},
+        owned_device_id, owned_event_id, room_id,
+        serde::Raw,
+        user_id,
+    };
+    use serde_json::{Value, json};
+    use tokio::{
+        sync::mpsc,
+        time::{Duration, timeout},
+    };
+
+    use super::{
+        RawRoomEvent, RawRoomEventEncryptionInfo, RawRoomEventListener, RawRoomRelationsDirection,
+        RawRoomRelationsOptions, Room,
+    };
+
+    struct TestRawRoomEventListener {
+        sender: Mutex<mpsc::UnboundedSender<RawRoomEvent>>,
+    }
+
+    impl RawRoomEventListener for TestRawRoomEventListener {
+        fn on_event(&self, event: RawRoomEvent) {
+            let _ = self.sender.lock().expect("listener mutex poisoned").send(event);
+        }
+    }
+
+    #[test]
+    fn test_raw_room_event_encryption_info_maps_algorithm_details() {
+        let megolm_info = EncryptionInfo {
+            sender: user_id!("@alice:example.org").to_owned(),
+            sender_device: Some(owned_device_id!("ALICEDEVICE")),
+            forwarder: None,
+            algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key: "megolm_curve25519_key".to_owned(),
+                sender_claimed_keys: BTreeMap::from([(
+                    DeviceKeyAlgorithm::Ed25519,
+                    "claimed_ed25519_key".to_owned(),
+                )]),
+                session_id: Some("session_id".to_owned()),
+            },
+            verification_state: EventVerificationState::Verified,
+        };
+
+        let mapped = RawRoomEventEncryptionInfo::from(&megolm_info);
+        assert_eq!(mapped.sender, "@alice:example.org");
+        assert_eq!(mapped.sender_device.as_deref(), Some("ALICEDEVICE"));
+        assert_eq!(mapped.sender_curve25519_key_base64.as_deref(), Some("megolm_curve25519_key"));
+        assert!(mapped.sender_verified);
+
+        let olm_info = EncryptionInfo {
+            sender: user_id!("@bob:example.org").to_owned(),
+            sender_device: None,
+            forwarder: None,
+            algorithm_info: AlgorithmInfo::OlmV1Curve25519AesSha2 {
+                curve25519_public_key_base64: "olm_curve25519_key".to_owned(),
+            },
+            verification_state: EventVerificationState::Unverified(
+                VerificationLevel::UnsignedDevice,
+            ),
+        };
+
+        let mapped = RawRoomEventEncryptionInfo::from(&olm_info);
+        assert_eq!(mapped.sender, "@bob:example.org");
+        assert!(mapped.sender_device.is_none());
+        assert_eq!(mapped.sender_curve25519_key_base64.as_deref(), Some("olm_curve25519_key"));
+        assert!(!mapped.sender_verified);
+    }
+
+    #[tokio::test]
+    async fn test_raw_timeline_event_listener_receives_filtered_relation_events() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!matrixrtc:example.org");
+        let sender = user_id!("@alice:example.org");
+        let membership_event_id = "$membership:example.org";
+        let reaction_event_id = "$reaction:example.org";
+
+        let sdk_room = server.sync_joined_room(&client, room_id).await;
+        let room = Room::new(sdk_room, None);
+
+        let (sender_tx, mut receiver) = mpsc::unbounded_channel();
+        let _listener_handle = room.subscribe_to_raw_timeline_events(
+            vec!["m.reaction".to_owned(), "m.room.redaction".to_owned()],
+            Box::new(TestRawRoomEventListener { sender: Mutex::new(sender_tx) }),
+        );
+
+        let ignored_event = Raw::new(&json!({
+            "content": {
+                "body": "ignored",
+                "msgtype": "m.text",
+            },
+            "event_id": "$message:example.org",
+            "origin_server_ts": 999,
+            "room_id": room_id,
+            "sender": sender,
+            "type": "m.room.message",
+        }))
+        .expect("raw ignored event should serialize")
+        .cast_unchecked::<AnySyncTimelineEvent>();
+
+        let reaction_event = Raw::new(&json!({
+            "content": {
+                "m.relates_to": {
+                    "event_id": membership_event_id,
+                    "key": "\u{1f590}\u{fe0f}",
+                    "rel_type": "m.annotation",
+                },
+            },
+            "event_id": reaction_event_id,
+            "origin_server_ts": 1234,
+            "room_id": room_id,
+            "sender": sender,
+            "type": "m.reaction",
+        }))
+        .expect("raw reaction event should serialize")
+        .cast_unchecked::<AnySyncTimelineEvent>();
+
+        let redaction_event = Raw::new(&json!({
+            "content": {},
+            "event_id": "$redaction:example.org",
+            "origin_server_ts": 1235,
+            "redacts": reaction_event_id,
+            "room_id": room_id,
+            "sender": sender,
+            "type": "m.room.redaction",
+        }))
+        .expect("raw redaction event should serialize")
+        .cast_unchecked::<AnySyncTimelineEvent>();
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
+                    ignored_event,
+                    reaction_event,
+                    redaction_event,
+                ]),
+            )
+            .await;
+
+        let reaction = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("listener should receive the reaction event")
+            .expect("listener channel should stay open");
+        assert_eq!(reaction.room_id, room_id.to_string());
+        assert_eq!(reaction.event_type, "m.reaction");
+        assert_eq!(reaction.event_id.as_deref(), Some(reaction_event_id));
+        assert_eq!(reaction.sender.as_deref(), Some(sender.as_str()));
+        assert_eq!(reaction.origin_server_ts_ms, Some(1234));
+        assert!(reaction.encryption_info.is_none());
+
+        let content: Value =
+            serde_json::from_str(&reaction.content_json).expect("content should be JSON");
+        assert_eq!(content["m.relates_to"]["event_id"], membership_event_id);
+        assert_eq!(content["m.relates_to"]["rel_type"], "m.annotation");
+        assert_eq!(content["m.relates_to"]["key"], "\u{1f590}\u{fe0f}");
+
+        let raw: Value = serde_json::from_str(&reaction.raw_json).expect("raw should be JSON");
+        assert_eq!(raw["event_id"], reaction_event_id);
+        assert_eq!(raw["type"], "m.reaction");
+
+        let redaction = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("listener should receive the redaction event")
+            .expect("listener channel should stay open");
+        assert_eq!(redaction.event_type, "m.room.redaction");
+        assert_eq!(redaction.event_id.as_deref(), Some("$redaction:example.org"));
+
+        let raw: Value = serde_json::from_str(&redaction.raw_json).expect("raw should be JSON");
+        assert_eq!(raw["redacts"], reaction_event_id);
+    }
+
+    #[tokio::test]
+    async fn test_get_event_relations_returns_filtered_raw_relation_events() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!matrixrtc:example.org");
+        let sender = user_id!("@alice:example.org");
+        let target_event_id = owned_event_id!("$membership:example.org");
+        let reaction_event_id = event_id!("$reaction:example.org");
+        let f = EventFactory::new().room(room_id).sender(sender);
+
+        let reaction_event = f
+            .reaction(&target_event_id, "\u{1f590}\u{fe0f}")
+            .event_id(reaction_event_id)
+            .into_raw();
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .match_subrequest(IncludeRelations::RelationsOfTypeAndEventType(
+                RelationType::Annotation,
+                TimelineEventType::Reaction,
+            ))
+            .match_from("next_batch")
+            .match_limit(20)
+            .ok(RoomRelationsResponseTemplate::default()
+                .events(vec![reaction_event])
+                .prev_batch("prev_batch")
+                .next_batch("more")
+                .recursion_depth(1))
+            .mock_once()
+            .mount()
+            .await;
+
+        let sdk_room = server.sync_joined_room(&client, room_id).await;
+        let room = Room::new(sdk_room, None);
+
+        let result = room
+            .get_event_relations(
+                target_event_id.to_string(),
+                RawRoomRelationsOptions {
+                    relation_type: Some("m.annotation".to_owned()),
+                    event_type: Some("m.reaction".to_owned()),
+                    from: Some("next_batch".to_owned()),
+                    limit: Some(20),
+                    direction: RawRoomRelationsDirection::Backward,
+                    recurse: true,
+                },
+            )
+            .await
+            .expect("room relations should load");
+
+        assert_eq!(result.prev_batch_token.as_deref(), Some("prev_batch"));
+        assert_eq!(result.next_batch_token.as_deref(), Some("more"));
+        assert_eq!(result.recursion_depth, Some(1));
+        assert_eq!(result.chunk.len(), 1);
+
+        let reaction = &result.chunk[0];
+        assert_eq!(reaction.room_id, room_id.to_string());
+        assert_eq!(reaction.event_type, "m.reaction");
+        assert_eq!(reaction.event_id.as_deref(), Some(reaction_event_id.as_str()));
+        assert_eq!(reaction.sender.as_deref(), Some(sender.as_str()));
+        assert!(reaction.encryption_info.is_none());
+
+        let content: Value =
+            serde_json::from_str(&reaction.content_json).expect("content should be JSON");
+        assert_eq!(content["m.relates_to"]["event_id"], target_event_id.as_str());
+        assert_eq!(content["m.relates_to"]["rel_type"], "m.annotation");
+        assert_eq!(content["m.relates_to"]["key"], "\u{1f590}\u{fe0f}");
+
+        let raw: Value = serde_json::from_str(&reaction.raw_json).expect("raw should be JSON");
+        assert_eq!(raw["event_id"], reaction_event_id.as_str());
+        assert_eq!(raw["type"], "m.reaction");
     }
 }

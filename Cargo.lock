@@ -3433,6 +3433,7 @@ dependencies = [
  "matrix-sdk-base",
  "matrix-sdk-common",
  "matrix-sdk-ffi-macros",
+ "matrix-sdk-test",
  "matrix-sdk-ui",
  "mime",
  "oauth2",

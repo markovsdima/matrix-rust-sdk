@@ -42,7 +42,8 @@ use matrix_sdk::{
     },
     send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
 };
-use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_base::latest_event::LatestEventValue as BaseLatestEventValue;
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm, serde_helpers::extract_thread_root};
 use matrix_sdk_ui::{
     timeline::{RoomExt, TimelineBuilder, default_event_filter},
     unable_to_decrypt_hook::UtdHookManager,
@@ -55,7 +56,7 @@ use ruma::{
     assign,
     events::{
         AnyMessageLikeEventContent, AnySyncTimelineEvent, TimelineEventType,
-        receipt::ReceiptThread,
+        receipt::{ReceiptThread, ReceiptType as RumaReceiptType},
         relation::RelationType,
         room::{
             MediaSource as RumaMediaSource,
@@ -140,6 +141,46 @@ impl Room {
     pub(crate) fn new(inner: SdkRoom, utd_hook_manager: Option<Arc<UtdHookManager>>) -> Self {
         Room { inner, utd_hook_manager }
     }
+
+    async fn read_receipt_summary_for_event_id(
+        &self,
+        event_id: &EventId,
+        scope: ReadReceiptThreadScope,
+    ) -> Result<EventReadReceiptSummary, ClientError> {
+        let receipt_threads = match scope {
+            ReadReceiptThreadScope::Main => {
+                // Keep compatibility with clients that send either unthreaded receipts
+                // or explicit main-thread receipts.
+                vec![ReceiptThread::Main, ReceiptThread::Unthreaded]
+            }
+            ReadReceiptThreadScope::Thread { root_event_id } => {
+                vec![ReceiptThread::Thread(EventId::parse(root_event_id)?)]
+            }
+        };
+
+        let own_user_id = self.inner.own_user_id();
+        let mut read_by_user_ids = HashSet::new();
+
+        for receipt_thread in receipt_threads {
+            for (user_id, _receipt) in self
+                .inner
+                .load_event_receipts(RumaReceiptType::Read, receipt_thread, event_id)
+                .await?
+            {
+                if user_id.as_str() != own_user_id.as_str() {
+                    read_by_user_ids.insert(user_id);
+                }
+            }
+        }
+
+        let read_by_count = read_by_user_ids.len().try_into().unwrap_or(u32::MAX);
+
+        Ok(EventReadReceiptSummary {
+            event_id: event_id.to_string(),
+            read_by_count,
+            has_read_receipt_from_other_user: read_by_count > 0,
+        })
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -178,6 +219,19 @@ pub struct RawRoomEvent {
     pub content_json: String,
     pub raw_json: String,
     pub encryption_info: Option<RawRoomEventEncryptionInfo>,
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum ReadReceiptThreadScope {
+    Main,
+    Thread { root_event_id: String },
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct EventReadReceiptSummary {
+    pub event_id: String,
+    pub read_by_count: u32,
+    pub has_read_receipt_from_other_user: bool,
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
@@ -600,6 +654,52 @@ impl Room {
 
     async fn latest_event(&self) -> LatestEventValue {
         self.inner.latest_event().await.into()
+    }
+
+    /// Summarize public read receipts from other users for a specific event.
+    ///
+    /// Use [`ReadReceiptThreadScope::Main`] for the main room timeline. It will
+    /// consider both `main` and unthreaded receipts for compatibility.
+    pub async fn read_receipt_summary_for_event(
+        &self,
+        event_id: String,
+        scope: ReadReceiptThreadScope,
+    ) -> Result<EventReadReceiptSummary, ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        self.read_receipt_summary_for_event_id(&event_id, scope).await
+    }
+
+    /// If the room's latest main-timeline event is our own remote event,
+    /// summarize public read receipts from other users for it.
+    pub async fn latest_own_main_timeline_read_receipt_summary(
+        &self,
+    ) -> Result<Option<EventReadReceiptSummary>, ClientError> {
+        let own_user_id = self.inner.own_user_id();
+
+        let Some(event_id) = (match matrix_sdk_base::Room::latest_event(&self.inner) {
+            BaseLatestEventValue::Remote(timeline_event) => {
+                if !timeline_event.sender().is_some_and(|sender| sender == own_user_id) {
+                    return Ok(None);
+                }
+
+                if extract_thread_root(timeline_event.raw()).is_some() {
+                    return Ok(None);
+                }
+
+                timeline_event.event_id()
+            }
+            BaseLatestEventValue::None
+            | BaseLatestEventValue::RemoteInvite { .. }
+            | BaseLatestEventValue::LocalIsSending(_)
+            | BaseLatestEventValue::LocalHasBeenSent { .. }
+            | BaseLatestEventValue::LocalCannotBeSent(_) => None,
+        }) else {
+            return Ok(None);
+        };
+
+        self.read_receipt_summary_for_event_id(&event_id, ReadReceiptThreadScope::Main)
+            .await
+            .map(Some)
     }
 
     pub async fn latest_encryption_state(&self) -> Result<EncryptionState, ClientError> {
@@ -3824,15 +3924,25 @@ mod tests {
             VerificationState as EventVerificationState,
         },
         room::IncludeRelations,
+        store::SerializableEventContent,
         test_utils::mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
+    };
+    use matrix_sdk_base::{
+        RoomInfoNotableUpdateReasons,
+        latest_event::{LatestEventValue as BaseLatestEventValue, LocalLatestEventValue},
     };
     use matrix_sdk_test::{JoinedRoomBuilder, event_factory::EventFactory};
     use ruma::{
-        DeviceKeyAlgorithm, event_id,
-        events::{AnySyncTimelineEvent, TimelineEventType, relation::RelationType},
+        DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, event_id,
+        events::{
+            AnyMessageLikeEventContent, AnySyncTimelineEvent, TimelineEventType,
+            receipt::{ReceiptThread, ReceiptType},
+            relation::RelationType,
+            room::message::RoomMessageEventContent,
+        },
         owned_device_id, owned_event_id, room_id,
         serde::Raw,
-        user_id,
+        uint, user_id,
     };
     use serde_json::{Value, json};
     use tokio::{
@@ -3842,7 +3952,7 @@ mod tests {
 
     use super::{
         RawRoomEvent, RawRoomEventEncryptionInfo, RawRoomEventListener, RawRoomRelationsDirection,
-        RawRoomRelationsOptions, Room,
+        RawRoomRelationsOptions, ReadReceiptThreadScope, Room,
     };
 
     struct TestRawRoomEventListener {
@@ -3852,6 +3962,25 @@ mod tests {
     impl RawRoomEventListener for TestRawRoomEventListener {
         fn on_event(&self, event: RawRoomEvent) {
             let _ = self.sender.lock().expect("listener mutex poisoned").send(event);
+        }
+    }
+
+    async fn set_latest_event_value(room: &Room, latest_event_value: BaseLatestEventValue) {
+        room.inner
+            .update_room_info(|mut room_info| {
+                room_info.set_latest_event(latest_event_value);
+                (room_info, RoomInfoNotableUpdateReasons::LATEST_EVENT)
+            })
+            .await;
+    }
+
+    fn local_latest_event_value() -> LocalLatestEventValue {
+        LocalLatestEventValue {
+            timestamp: MilliSecondsSinceUnixEpoch(uint!(42)),
+            content: SerializableEventContent::new(&AnyMessageLikeEventContent::RoomMessage(
+                RoomMessageEventContent::text_plain("local echo"),
+            ))
+            .expect("local echo content should serialize"),
         }
     }
 
@@ -3999,6 +4128,193 @@ mod tests {
 
         let raw: Value = serde_json::from_str(&redaction.raw_json).expect("raw should be JSON");
         assert_eq!(raw["redacts"], reaction_event_id);
+    }
+
+    #[tokio::test]
+    async fn test_read_receipt_summary_for_event_counts_other_users_by_scope() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!receipts:example.org");
+        let event_id = event_id!("$message:example.org");
+        let thread_root_id = event_id!("$thread-root:example.org");
+        let own_user_id = client.user_id().expect("client should be logged in");
+        let reader = user_id!("@reader:example.org");
+        let thread_reader = user_id!("@thread-reader:example.org");
+
+        let sdk_room = server.sync_joined_room(&client, room_id).await;
+        let room = Room::new(sdk_room, None);
+
+        let f = EventFactory::new().room(room_id);
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_receipt(
+                    f.read_receipts()
+                        .add(event_id, reader, ReceiptType::Read, ReceiptThread::Main)
+                        .add(event_id, reader, ReceiptType::Read, ReceiptThread::Unthreaded)
+                        .add(event_id, own_user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
+                        .add(
+                            event_id,
+                            thread_reader,
+                            ReceiptType::Read,
+                            ReceiptThread::Thread(thread_root_id.to_owned()),
+                        )
+                        .into_event(),
+                ),
+            )
+            .await;
+
+        let main_summary = room
+            .read_receipt_summary_for_event(event_id.to_string(), ReadReceiptThreadScope::Main)
+            .await
+            .expect("summary should load");
+        assert_eq!(main_summary.event_id, event_id.to_string());
+        assert_eq!(main_summary.read_by_count, 1);
+        assert!(main_summary.has_read_receipt_from_other_user);
+
+        let thread_summary = room
+            .read_receipt_summary_for_event(
+                event_id.to_string(),
+                ReadReceiptThreadScope::Thread { root_event_id: thread_root_id.to_string() },
+            )
+            .await
+            .expect("thread summary should load");
+        assert_eq!(thread_summary.read_by_count, 1);
+        assert!(thread_summary.has_read_receipt_from_other_user);
+    }
+
+    #[tokio::test]
+    async fn test_latest_own_main_timeline_read_receipt_summary_gates_latest_event() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!latest-receipts:example.org");
+        let own_event_id = event_id!("$own-message:example.org");
+        let other_event_id = event_id!("$other-message:example.org");
+        let thread_root_id = event_id!("$thread-root:example.org");
+        let threaded_event_id = event_id!("$threaded-message:example.org");
+        let own_user_id = client.user_id().expect("client should be logged in");
+        let other_user_id = user_id!("@other:example.org");
+        let reader = user_id!("@reader:example.org");
+
+        let sdk_room = server.sync_joined_room(&client, room_id).await;
+        let room = Room::new(sdk_room, None);
+
+        let own_events = EventFactory::new().room(room_id).sender(own_user_id);
+        let other_events = EventFactory::new().room(room_id).sender(other_user_id);
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_receipt(
+                    own_events
+                        .read_receipts()
+                        .add(own_event_id, reader, ReceiptType::Read, ReceiptThread::Unthreaded)
+                        .into_event(),
+                ),
+            )
+            .await;
+
+        set_latest_event_value(
+            &room,
+            BaseLatestEventValue::Remote(
+                own_events.text_msg("own").event_id(own_event_id).into_event(),
+            ),
+        )
+        .await;
+
+        let summary = room
+            .latest_own_main_timeline_read_receipt_summary()
+            .await
+            .expect("summary should load")
+            .expect("own remote latest event should have a summary");
+        assert_eq!(summary.event_id, own_event_id.to_string());
+        assert_eq!(summary.read_by_count, 1);
+        assert!(summary.has_read_receipt_from_other_user);
+
+        set_latest_event_value(
+            &room,
+            BaseLatestEventValue::Remote(
+                other_events.text_msg("other").event_id(other_event_id).into_event(),
+            ),
+        )
+        .await;
+        assert!(
+            room.latest_own_main_timeline_read_receipt_summary()
+                .await
+                .expect("summary should load")
+                .is_none()
+        );
+
+        set_latest_event_value(
+            &room,
+            BaseLatestEventValue::Remote(
+                own_events
+                    .text_msg("threaded")
+                    .event_id(threaded_event_id)
+                    .in_thread(thread_root_id, thread_root_id)
+                    .into_event(),
+            ),
+        )
+        .await;
+        assert!(
+            room.latest_own_main_timeline_read_receipt_summary()
+                .await
+                .expect("summary should load")
+                .is_none()
+        );
+
+        set_latest_event_value(
+            &room,
+            BaseLatestEventValue::LocalIsSending(local_latest_event_value()),
+        )
+        .await;
+        assert!(
+            room.latest_own_main_timeline_read_receipt_summary()
+                .await
+                .expect("summary should load")
+                .is_none()
+        );
+
+        set_latest_event_value(
+            &room,
+            BaseLatestEventValue::LocalHasBeenSent {
+                event_id: owned_event_id!("$local-has-been-sent:example.org"),
+                value: local_latest_event_value(),
+            },
+        )
+        .await;
+        assert!(
+            room.latest_own_main_timeline_read_receipt_summary()
+                .await
+                .expect("summary should load")
+                .is_none()
+        );
+
+        set_latest_event_value(
+            &room,
+            BaseLatestEventValue::RemoteInvite {
+                event_id: Some(owned_event_id!("$invite:example.org")),
+                timestamp: MilliSecondsSinceUnixEpoch(uint!(43)),
+                inviter: Some(other_user_id.to_owned()),
+            },
+        )
+        .await;
+        assert!(
+            room.latest_own_main_timeline_read_receipt_summary()
+                .await
+                .expect("summary should load")
+                .is_none()
+        );
+
+        set_latest_event_value(&room, BaseLatestEventValue::None).await;
+        assert!(
+            room.latest_own_main_timeline_read_receipt_summary()
+                .await
+                .expect("summary should load")
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -383,7 +383,11 @@ mod tests {
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
-        api::client::discovery::get_supported_versions, assign, event_id, room_id, serde::Raw,
+        api::client::discovery::get_supported_versions,
+        assign, event_id,
+        events::receipt::{ReceiptThread, ReceiptType},
+        room_id,
+        serde::Raw,
         user_id,
     };
     use serde_json::json;
@@ -793,5 +797,41 @@ mod tests {
 
         // Then the stream gets quiet.
         assert!(room_info_notable_update_stream.is_empty());
+
+        // When a receipt extension update is received from another user, it doesn't
+        // affect our unread counts but should still notify room-list observers.
+        let receipt_event = f
+            .read_receipts()
+            .add(
+                event_id!("$4"),
+                user_id!("@reader:e.uk"),
+                ReceiptType::Read,
+                ReceiptThread::Unthreaded,
+            )
+            .into_event();
+        let mut response = http::Response::new("6".to_owned());
+        response.extensions.receipts.rooms.insert(room_id.to_owned(), receipt_event.into_raw());
+
+        let mut processor = SlidingSyncResponseProcessor::new(client.clone());
+        {
+            let state_store_guard = client.base_client().state_store_lock().lock().await;
+            processor
+                .handle_room_response(
+                    &response,
+                    &RequestedRequiredStates::default(),
+                    &state_store_guard,
+                )
+                .await
+                .expect("Failed to process sync");
+        }
+        processor.process_and_take_response().await.expect("Failed to finish processing sync");
+
+        assert_matches!(
+            room_info_notable_update_stream.recv().await,
+            Ok(RoomInfoNotableUpdate { room_id: received_room_id, reasons: received_reasons }) => {
+                assert_eq!(received_room_id, room_id);
+                assert!(received_reasons.contains(RoomInfoNotableUpdateReasons::READ_RECEIPT), "{received_reasons:?}");
+            }
+        );
     }
 }

@@ -26,7 +26,7 @@ use tracing::{instrument, trace};
 
 use super::BaseClient;
 use crate::{
-    RequestedRequiredStates,
+    RequestedRequiredStates, RoomInfoNotableUpdateReasons,
     error::Result,
     response_processors as processors,
     store::ambiguity_map::AmbiguityCache,
@@ -268,6 +268,13 @@ impl BaseClient {
         // Save the new `RoomInfo` if updated.
         if save_context {
             processors::changes::save_only(context, &self.state_store, state_store_guard).await?;
+
+            if let Some(room) = self.state_store.room(room_id) {
+                room.update_room_info_with_store_guard(state_store_guard, |room_info| {
+                    (room_info, RoomInfoNotableUpdateReasons::READ_RECEIPT)
+                })
+                .map_err(crate::store::StoreError::from)?;
+            }
         }
 
         Ok(receipt_ephemeral_event)

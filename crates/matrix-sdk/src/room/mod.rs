@@ -177,7 +177,7 @@ use crate::{
     event_cache::{self, EventCacheDropHandles, RoomEventCache},
     event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent},
     live_locations_observer::LiveLocationsObserver,
-    media::{MediaFormat, MediaRequestParameters},
+    media::{Media, MediaFormat, MediaRequestParameters},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
     room::{
         knock_requests::{KnockRequest, KnockRequestMemberInfo},
@@ -2791,9 +2791,12 @@ impl Room {
                     source: source.clone(),
                     format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(width, height)),
                 };
+                // The send-queue path creates the same `File` entry when replacing its local
+                // cache key after upload; direct sends need to normalize it here instead.
+                let request = Media::normalize_encrypted_thumbnail_request(&request);
 
                 if let Err(err) = media_store_lock_guard
-                    .add_media_content(&request, data, IgnoreMediaRetentionPolicy::No)
+                    .add_media_content(request.as_ref(), data, IgnoreMediaRetentionPolicy::No)
                     .await
                 {
                     warn!("unable to cache the media after uploading it: {err}");

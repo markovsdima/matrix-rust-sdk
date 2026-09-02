@@ -15,6 +15,7 @@
 
 //! High-level media API.
 
+use std::borrow::Cow;
 #[cfg(feature = "e2e-encryption")]
 use std::io::Read;
 use std::time::Duration;
@@ -426,6 +427,9 @@ impl Media {
             return self.get_local_media_content(uri).await;
         }
 
+        let request = Self::normalize_encrypted_thumbnail_request(request);
+        let request = request.as_ref();
+
         // Read from the cache.
         if use_cache
             && let Some(content) =
@@ -553,7 +557,8 @@ impl Media {
     ///
     /// * `request` - The `MediaRequest` of the content.
     pub async fn remove_media_content(&self, request: &MediaRequestParameters) -> Result<()> {
-        Ok(self.client.media_store().lock().await?.remove_media_content(request).await?)
+        let request = Self::normalize_encrypted_thumbnail_request(request);
+        Ok(self.client.media_store().lock().await?.remove_media_content(request.as_ref()).await?)
     }
 
     /// Delete all the media content corresponding to the given
@@ -655,6 +660,10 @@ impl Media {
     /// This is a convenience method that calls the
     /// [`remove_media_content`](#method.remove_media_content) method.
     ///
+    /// For encrypted images and videos without a separate thumbnail, the
+    /// thumbnail source is the full file. Removing that shared cache entry also
+    /// removes the cached full file.
+    ///
     /// # Arguments
     ///
     /// * `event_content` - The media event content.
@@ -666,7 +675,7 @@ impl Media {
         event_content: &impl MediaEventContent,
         settings: MediaThumbnailSettings,
     ) -> Result<()> {
-        if let Some(source) = event_content.source() {
+        if let Some(source) = event_content.thumbnail_source() {
             self.remove_media_content(&MediaRequestParameters {
                 source,
                 format: MediaFormat::Thumbnail(settings),
@@ -775,6 +784,25 @@ impl Media {
         }
     }
 
+    /// Encrypted media cannot be resized by the homeserver, so a thumbnail
+    /// request retrieves the same bytes as a file request and must use the same
+    /// cache key.
+    pub(crate) fn normalize_encrypted_thumbnail_request(
+        request: &MediaRequestParameters,
+    ) -> Cow<'_, MediaRequestParameters> {
+        if matches!(
+            (&request.source, &request.format),
+            (MediaSource::Encrypted(_), MediaFormat::Thumbnail(_))
+        ) {
+            Cow::Owned(MediaRequestParameters {
+                source: request.source.clone(),
+                format: MediaFormat::File,
+            })
+        } else {
+            Cow::Borrowed(request)
+        }
+    }
+
     /// Returns the local MXC URI contained by the given source, if any.
     ///
     /// A local MXC URI is a URI that was generated with `make_local_uri`.
@@ -796,11 +824,11 @@ mod tests {
     use ruma::{
         MxcUri,
         events::room::{EncryptedFile, MediaSource},
-        mxc_uri, owned_mxc_uri,
+        mxc_uri, owned_mxc_uri, uint,
     };
     use serde_json::json;
 
-    use super::Media;
+    use super::{Media, MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
 
     /// Create an `EncryptedFile` with the given MXC URI.
     fn encrypted_file(mxc_uri: &MxcUri) -> Box<EncryptedFile> {
@@ -854,5 +882,161 @@ mod tests {
         // Test invalid MXC URI.
         let source = MediaSource::Plain("https://server.local/nbvcxw".into());
         assert_matches!(Media::as_local_uri(&source), None);
+    }
+
+    #[test]
+    fn test_normalize_encrypted_thumbnail_request() {
+        let uri = mxc_uri!("mxc://server.local/encrypted-media");
+        let source = MediaSource::Encrypted(encrypted_file(uri));
+        let thumbnail_request = MediaRequestParameters {
+            source: source.clone(),
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(uint!(32), uint!(24))),
+        };
+
+        let normalized = Media::normalize_encrypted_thumbnail_request(&thumbnail_request);
+        assert_matches!(
+            normalized.as_ref(),
+            MediaRequestParameters {
+                source: MediaSource::Encrypted(file),
+                format: MediaFormat::File,
+            }
+        );
+        assert_eq!(file.url.as_str(), uri.as_str());
+
+        let file_request = MediaRequestParameters { source, format: MediaFormat::File };
+        assert_matches!(
+            Media::normalize_encrypted_thumbnail_request(&file_request),
+            std::borrow::Cow::Borrowed(_)
+        );
+
+        let plain_thumbnail_request = MediaRequestParameters {
+            source: MediaSource::Plain(owned_mxc_uri!("mxc://server.local/plain-media")),
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(uint!(32), uint!(24))),
+        };
+        assert_matches!(
+            Media::normalize_encrypted_thumbnail_request(&plain_thumbnail_request),
+            std::borrow::Cow::Borrowed(_)
+        );
+    }
+}
+
+// The HTTP mocking library is not supported for wasm32.
+#[cfg(all(test, not(target_family = "wasm")))]
+mod native_tests {
+    #[cfg(feature = "e2e-encryption")]
+    use std::io::{Cursor, Read};
+
+    #[cfg(feature = "e2e-encryption")]
+    use matrix_sdk_base::crypto::AttachmentEncryptor;
+    use matrix_sdk_base::media::store::IgnoreMediaRetentionPolicy;
+    use matrix_sdk_test::async_test;
+    #[cfg(feature = "e2e-encryption")]
+    use ruma::events::room::EncryptedFile;
+    use ruma::{
+        assign,
+        events::room::{ImageInfo, MediaSource, message::ImageMessageEventContent},
+        owned_mxc_uri, uint,
+    };
+
+    use super::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
+    use crate::test_utils::mocks::MatrixMockServer;
+
+    #[async_test]
+    async fn test_remove_thumbnail_uses_thumbnail_source() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let uri = owned_mxc_uri!("mxc://server.local/media");
+        let source = MediaSource::Plain(uri.clone());
+        let thumbnail_source = MediaSource::Plain(owned_mxc_uri!("mxc://server.local/thumbnail"));
+        let settings = MediaThumbnailSettings::new(uint!(32), uint!(24));
+        let file_request =
+            MediaRequestParameters { source: source.clone(), format: MediaFormat::File };
+        let thumbnail_request = MediaRequestParameters {
+            source: thumbnail_source.clone(),
+            format: MediaFormat::Thumbnail(settings.clone()),
+        };
+
+        let media_store = client.media_store().lock().await.unwrap();
+        media_store
+            .add_media_content(&file_request, b"media".to_vec(), IgnoreMediaRetentionPolicy::No)
+            .await
+            .unwrap();
+        media_store
+            .add_media_content(
+                &thumbnail_request,
+                b"thumbnail".to_vec(),
+                IgnoreMediaRetentionPolicy::No,
+            )
+            .await
+            .unwrap();
+        drop(media_store);
+
+        let event_content = ImageMessageEventContent::plain("image.jpg".into(), uri).info(
+            Box::new(assign!(ImageInfo::new(), {
+                thumbnail_source: Some(thumbnail_source),
+            })),
+        );
+        client.media().remove_thumbnail(&event_content, settings).await.unwrap();
+
+        let media_store = client.media_store().lock().await.unwrap();
+        assert!(media_store.get_media_content(&file_request).await.unwrap().is_some());
+        assert!(media_store.get_media_content(&thumbnail_request).await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_encrypted_thumbnail_and_file_share_cache_entry() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().no_server_versions().build().await;
+
+        server.mock_versions().with_versions(vec!["v1.11"]).ok().expect(1).mount().await;
+
+        let expected_content = b"encrypted media";
+        let mut cursor = Cursor::new(expected_content);
+        let mut encryptor = AttachmentEncryptor::new(&mut cursor);
+        let mut encrypted_content = Vec::new();
+        encryptor.read_to_end(&mut encrypted_content).unwrap();
+        let encryption_info = encryptor.finish();
+
+        let source = MediaSource::Encrypted(Box::new(EncryptedFile::new(
+            owned_mxc_uri!("mxc://server.local/encrypted-media"),
+            encryption_info.encryption_info,
+            encryption_info.hashes,
+        )));
+        let thumbnail_request = MediaRequestParameters {
+            source: source.clone(),
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(uint!(32), uint!(24))),
+        };
+        let file_request = MediaRequestParameters { source, format: MediaFormat::File };
+
+        let _download_guard = server
+            .mock_authed_media_download()
+            .ok_bytes(encrypted_content)
+            .expect(1)
+            .mount_as_scoped()
+            .await;
+
+        assert_eq!(
+            client.media().get_media_content(&thumbnail_request, true).await.unwrap(),
+            expected_content
+        );
+        assert_eq!(
+            client.media().get_media_content(&file_request, true).await.unwrap(),
+            expected_content
+        );
+
+        client.media().remove_media_content(&thumbnail_request).await.unwrap();
+        assert!(
+            client
+                .media_store()
+                .lock()
+                .await
+                .unwrap()
+                .get_media_content(&file_request)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -197,7 +197,9 @@ impl From<DateDividerMode> for matrix_sdk_ui::timeline::DateDividerMode {
 pub enum TimelineFilter {
     /// Show all the events in the timeline, independent of their type.
     All,
-    /// Show only `m.room.messages` of the given room message types.
+    /// Show only `m.room.messages` of the given room message types. Encrypted
+    /// events are retained until their message type can be determined; events
+    /// that remain undecryptable remain in the timeline.
     OnlyMessage {
         /// A list of [`RoomMessageEventMessageType`] that will be allowed to
         /// appear in the timeline.

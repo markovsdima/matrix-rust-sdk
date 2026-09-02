@@ -284,6 +284,27 @@ impl From<RawRoomRelationsDirection> for Direction {
     }
 }
 
+fn only_message_event_filter(
+    event: &AnySyncTimelineEvent,
+    types: &[crate::event::RoomMessageEventMessageType],
+) -> bool {
+    match event {
+        AnySyncTimelineEvent::MessageLike(msg) => match msg.original_content() {
+            Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
+                types.contains(&content.msgtype.into())
+            }
+            Some(AnyMessageLikeEventContent::RoomEncrypted(_)) => {
+                // UTD events must remain in the timeline so a `Set` can replace them once they
+                // are decrypted. If decryption reveals a message type excluded by this filter,
+                // the timeline will remove the item itself.
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 #[derive(Clone, uniffi::Record)]
 pub struct RawRoomRelationsOptions {
     pub relation_type: Option<String>,
@@ -450,17 +471,7 @@ impl Room {
             TimelineFilter::OnlyMessage { types } => {
                 builder = builder.event_filter(move |event, room_version_id| {
                     default_event_filter(event, room_version_id)
-                        && match event {
-                            AnySyncTimelineEvent::MessageLike(msg) => {
-                                match msg.original_content() {
-                                    Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
-                                        types.contains(&content.msgtype.into())
-                                    }
-                                    _ => false,
-                                }
-                            }
-                            _ => false,
-                        }
+                        && only_message_event_filter(event, &types)
                 });
             }
 
@@ -3952,8 +3963,45 @@ mod tests {
 
     use super::{
         RawRoomEvent, RawRoomEventEncryptionInfo, RawRoomEventListener, RawRoomRelationsDirection,
-        RawRoomRelationsOptions, ReadReceiptThreadScope, Room,
+        RawRoomRelationsOptions, ReadReceiptThreadScope, Room, only_message_event_filter,
     };
+
+    #[test]
+    fn only_message_filter_keeps_encrypted_events() {
+        let event: AnySyncTimelineEvent = serde_json::from_value(json!({
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": "NOT_REAL_CIPHERTEXT",
+                "device_id": "DEVICE_ID",
+                "sender_key": "SENDER_KEY",
+                "session_id": "SESSION_ID",
+            },
+            "event_id": "$encrypted:example.org",
+            "origin_server_ts": 1,
+            "sender": "@alice:example.org",
+            "type": "m.room.encrypted",
+        }))
+        .expect("encrypted event should deserialize");
+
+        assert!(only_message_event_filter(&event, &[]));
+
+        let text_event: AnySyncTimelineEvent = serde_json::from_value(json!({
+            "content": {
+                "body": "not an attachment",
+                "msgtype": "m.text",
+            },
+            "event_id": "$text:example.org",
+            "origin_server_ts": 2,
+            "sender": "@alice:example.org",
+            "type": "m.room.message",
+        }))
+        .expect("text event should deserialize");
+
+        assert!(!only_message_event_filter(
+            &text_event,
+            &[crate::event::RoomMessageEventMessageType::Image]
+        ));
+    }
 
     struct TestRawRoomEventListener {
         sender: Mutex<mpsc::UnboundedSender<RawRoomEvent>>,

@@ -60,7 +60,10 @@ use tokio::sync::Mutex;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-pub use self::{content::TimelineItemContent, msg_like::MessageContent};
+pub use self::{
+    content::TimelineItemContent,
+    msg_like::{MessageContent, PollAnswer},
+};
 use crate::{
     error::{ClientError, RoomError},
     event::EventOrTransactionId,

@@ -62,7 +62,7 @@ use uuid::Uuid;
 
 pub use self::{
     content::TimelineItemContent,
-    msg_like::{MessageContent, PollAnswer},
+    msg_like::{EncryptedMessage, MessageContent, PollAnswer},
 };
 use crate::{
     error::{ClientError, RoomError},

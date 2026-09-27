@@ -270,7 +270,36 @@ fn generate_uniffi(library_path: &Utf8Path, ffi_directory: &Utf8Path) -> Result<
         out_dir: ffi_directory.to_path_buf(),
         ..GenerateOptions::default()
     })?;
+    // UniFFI 0.31's Swift async helper does not forward Task cancellation.
+    // Opt in only inspection, whose contract requires cancelling owned work.
+    let swift_path = ffi_directory.join("matrix_sdk_ffi.swift");
+    let swift = std::fs::read_to_string(&swift_path)?;
+    std::fs::write(&swift_path, enable_inspection_cancellation(&swift)?)?;
     Ok(())
+}
+
+fn enable_inspection_cancellation(swift: &str) -> Result<String> {
+    let marker = "open func inspectTimelineEvent(eventId: String)";
+    let start = swift.find(marker).ok_or("Missing generated inspectTimelineEvent method")?;
+    let end =
+        start + swift[start..].find("\n}").ok_or("Missing end of inspectTimelineEvent method")? + 2;
+    let method = &swift[start..end];
+    let call = "uniffiRustCallAsync(";
+    let free = "freeFunc: ffi_matrix_sdk_ffi_rust_future_free_rust_buffer,";
+    if method.matches(call).count() != 1 || method.matches(free).count() != 1 {
+        return Err("Unexpected UniFFI inspection wrapper; review its cancellation bridge".into());
+    }
+    let replacement = method.replace(call, "uniffiInspectionCallAsync(").replace(
+        free,
+        concat!(
+            "freeFunc: { ffi_matrix_sdk_ffi_rust_future_free_rust_buffer($0) },\n",
+            "            cancelFunc: { ffi_matrix_sdk_ffi_rust_future_cancel_rust_buffer($0) },",
+        ),
+    );
+    let mut result = swift.to_owned();
+    result.replace_range(start..end, &replacement);
+    result.push_str(include_str!("swift/InspectionCancellation.swift"));
+    Ok(result)
 }
 
 fn build_xcframework(

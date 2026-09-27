@@ -429,6 +429,11 @@ impl<'a> lock::Reload for RoomEventCacheStateLockWriteGuard<'a> {
 }
 
 impl<'a> RoomEventCacheStateLockReadGuard<'a> {
+    #[cfg(feature = "testing")]
+    pub fn event_focused_cache_count_for_testing(&self) -> usize {
+        self.state.event_focused_caches.len()
+    }
+
     /// Return the subscriber count.
     pub fn subscriber_count(&self) -> &Arc<AtomicUsize> {
         &self.state.subscriber_count

@@ -107,6 +107,7 @@ use crate::{
     utils::{AsyncRuntimeDropped, u64_to_uint},
 };
 
+mod inspection;
 mod polls;
 mod power_levels;
 pub mod room_info;

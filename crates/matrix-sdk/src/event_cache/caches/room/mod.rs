@@ -269,6 +269,10 @@ impl RoomEventCache {
     ///
     /// It starts by looking into loaded events before looking inside the
     /// storage.
+    ///
+    /// Errors from the event lookup itself are treated as a cache miss. Errors
+    /// acquiring or reloading the cache state are still returned. Use
+    /// [`Self::find_event_strict`] to propagate all lookup errors.
     pub async fn find_event(&self, event_id: &EventId) -> Result<Option<Event>> {
         Ok(self
             .inner
@@ -280,6 +284,27 @@ impl RoomEventCache {
             .ok()
             .flatten()
             .map(|(_loc, event)| event))
+    }
+
+    /// Find an event by ID, propagating cache state and storage lookup errors.
+    ///
+    /// Searches loaded events before storage, like [`Self::find_event`], but
+    /// returns `Ok(None)` only when the lookup succeeds without finding an event.
+    pub async fn find_event_strict(&self, event_id: &EventId) -> Result<Option<Event>> {
+        Ok(self
+            .inner
+            .state
+            .read()
+            .await?
+            .find_event(event_id)
+            .await?
+            .map(|(_loc, event)| event))
+    }
+
+    /// Number of retained event-focused caches, for integration tests.
+    #[cfg(feature = "testing")]
+    pub async fn event_focused_cache_count_for_testing(&self) -> Result<usize> {
+        Ok(self.inner.state.read().await?.event_focused_cache_count_for_testing())
     }
 
     /// Try to find an event by ID in this room, along with its related events.

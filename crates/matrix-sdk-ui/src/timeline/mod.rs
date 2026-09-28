@@ -267,11 +267,6 @@ impl Timeline {
             .await;
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn retry_decryption_for_all_events(&self) {
-        self.controller.retry_event_decryption(None).await;
-    }
-
     /// Get the current timeline item for the given event ID, if any.
     ///
     /// Will return a remote event, *or* a local echo that has been sent but not

@@ -16,7 +16,9 @@
 
 use std::collections::BTreeSet;
 
+use eyeball_im::VectorDiff;
 use matrix_sdk::{
+    deserialized_responses::TimelineEvent,
     event_cache::{
         EventFocusThreadMode, EventsOrigin, RoomEventCache, RoomEventCacheSubscriber,
         RoomEventCacheUpdate, TimelineVectorDiffs,
@@ -28,6 +30,25 @@ use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing::{error, instrument, trace, warn};
 
 use crate::timeline::{TimelineController, TimelineFocus, event_item::RemoteEventOrigin};
+
+/// Only inserted/reloaded events need a refresh after loading from disk.
+/// Set diffs come from redecryption, redactions, receipts or metadata updates;
+/// scheduling them again would feed the worker's own changes back into it.
+fn newly_loaded_events(diffs: &[VectorDiff<TimelineEvent>]) -> Vec<TimelineEvent> {
+    let mut events = Vec::new();
+    for diff in diffs {
+        match diff {
+            VectorDiff::Append { values } | VectorDiff::Reset { values } => {
+                events.extend(values.iter().cloned())
+            }
+            VectorDiff::PushFront { value }
+            | VectorDiff::PushBack { value }
+            | VectorDiff::Insert { value, .. } => events.push(value.clone()),
+            _ => {}
+        }
+    }
+    events
+}
 
 /// Long-lived task, in the pinned events focus mode, that updates the timeline
 /// after any changes in the pinned events.
@@ -184,12 +205,20 @@ pub(in crate::timeline) async fn thread_updates_task(
             EventsOrigin::Cache => RemoteEventOrigin::Cache,
         };
 
-        let has_diffs = !update.diffs.is_empty();
+        let loaded = if matches!(origin, RemoteEventOrigin::Cache) {
+            newly_loaded_events(&update.diffs)
+        } else {
+            Vec::new()
+        };
 
         timeline_controller.handle_remote_events_with_diffs(update.diffs, origin).await;
 
-        if has_diffs && matches!(origin, RemoteEventOrigin::Cache) {
-            timeline_controller.retry_event_decryption(None).await;
+        if !loaded.is_empty() {
+            timeline_controller
+                .room()
+                .client()
+                .event_cache()
+                .request_decryption_for_loaded_events(timeline_controller.room().room_id(), loaded);
         }
     }
 
@@ -251,7 +280,11 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                     EventsOrigin::Cache => RemoteEventOrigin::Cache,
                 };
 
-                let has_diffs = !diffs.is_empty();
+                let loaded = if matches!(origin, RemoteEventOrigin::Cache) {
+                    newly_loaded_events(&diffs)
+                } else {
+                    Vec::new()
+                };
 
                 if matches!(timeline_focus, TimelineFocus::Live { .. }) {
                     timeline_controller.handle_remote_events_with_diffs(diffs, origin).await;
@@ -261,8 +294,15 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                     timeline_controller.handle_remote_aggregations(diffs, origin).await;
                 }
 
-                if has_diffs && matches!(origin, RemoteEventOrigin::Cache) {
-                    timeline_controller.retry_event_decryption(None).await;
+                if !loaded.is_empty() {
+                    timeline_controller
+                        .room()
+                        .client()
+                        .event_cache()
+                        .request_decryption_for_loaded_events(
+                            timeline_controller.room().room_id(),
+                            loaded,
+                        );
                 }
             }
 

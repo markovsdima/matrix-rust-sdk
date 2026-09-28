@@ -333,8 +333,8 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
 
 /// Result of calling [`TimelineController::init_focus`].
 pub(super) struct InitFocusResult {
-    /// Did the initialization result in having some events in the timeline?
-    pub has_events: bool,
+    /// Loaded snapshots to retry without querying their full persisted sessions.
+    pub retry_events: Vec<TimelineEvent>,
     /// If the timeline is a non-live timeline, an extra task that subscribes to
     /// changes to the focus source.
     pub focus_task: Option<BackgroundTaskHandle>,
@@ -1339,7 +1339,7 @@ impl TimelineController {
                 // Retrieve the cached events, and add them to the timeline.
                 let events = room_event_cache.events().await?;
 
-                let has_events = !events.is_empty();
+                let retry_events = events.clone();
 
                 self.replace_with_initial_remote_events(events, RemoteEventOrigin::Cache).await;
 
@@ -1354,7 +1354,7 @@ impl TimelineController {
                     PaginationStatus::Paginating => {}
                 }
 
-                Ok(InitFocusResult { has_events, focus_task: None })
+                Ok(InitFocusResult { retry_events, focus_task: None })
             }
 
             TimelineFocus::Event { target: event_id, num_context_events, thread_mode } => {
@@ -1377,7 +1377,7 @@ impl TimelineController {
 
                 let (events, receiver) = cache.subscribe().await;
 
-                let has_events = !events.is_empty();
+                let retry_events = events.clone();
 
                 // Ask the cache for the thread root, if it managed to extract one or decided
                 // that the target event was the thread root.
@@ -1413,11 +1413,11 @@ impl TimelineController {
                     )
                     .abort_on_drop();
 
-                Ok(InitFocusResult { has_events, focus_task: Some(task) })
+                Ok(InitFocusResult { retry_events, focus_task: Some(task) })
             }
 
             TimelineFocus::Thread { root_event_id, .. } => {
-                let (has_events, receiver) =
+                let (retry_events, receiver) =
                     self.init_with_thread_root(root_event_id, room_event_cache).await?;
 
                 let room = &self.room_data_provider;
@@ -1443,14 +1443,14 @@ impl TimelineController {
                     )
                     .abort_on_drop();
 
-                Ok(InitFocusResult { has_events, focus_task: Some(task) })
+                Ok(InitFocusResult { retry_events, focus_task: Some(task) })
             }
 
             TimelineFocus::PinnedEvents => {
                 let (initial_events, pinned_events_recv) =
                     room_event_cache.subscribe_to_pinned_events().await?;
 
-                let has_events = !initial_events.is_empty();
+                let retry_events = initial_events.clone();
 
                 self.replace_with_initial_remote_events(
                     initial_events,
@@ -1472,7 +1472,7 @@ impl TimelineController {
                     )
                     .abort_on_drop();
 
-                Ok(InitFocusResult { has_events, focus_task: Some(task) })
+                Ok(InitFocusResult { retry_events, focus_task: Some(task) })
             }
         }
     }
@@ -1480,17 +1480,15 @@ impl TimelineController {
     /// (Re-)initialise a timeline using [`TimelineFocus::Thread`] with cached
     /// threaded events and secondary relations.
     ///
-    /// Returns whether there were any events added to the timeline, and a
-    /// receiver to return updates after the initial events have been
-    /// inserted in the timeline.
+    /// Returns the loaded events and a receiver for subsequent updates.
     pub(super) async fn init_with_thread_root(
         &self,
         root_event_id: &OwnedEventId,
         room_event_cache: &RoomEventCache,
-    ) -> Result<(bool, broadcast::Receiver<TimelineVectorDiffs>), Error> {
+    ) -> Result<(Vec<TimelineEvent>, broadcast::Receiver<TimelineVectorDiffs>), Error> {
         let (events, receiver) =
             room_event_cache.subscribe_to_thread(root_event_id.clone()).await?;
-        let has_events = !events.is_empty();
+        let mut retry_events = events.clone();
 
         // For each event, we also need to find the related events, as they don't
         // include the thread relationship, they won't be included in
@@ -1508,6 +1506,7 @@ impl TimelineController {
 
         // Now that we've inserted the thread events, add the aggregations too.
         if !related_events.is_empty() {
+            retry_events.extend(related_events.iter().cloned());
             self.handle_remote_aggregations(
                 vec![VectorDiff::Append { values: related_events }],
                 RemoteEventOrigin::Cache,
@@ -1515,7 +1514,7 @@ impl TimelineController {
             .await;
         }
 
-        Ok((has_events, receiver))
+        Ok((retry_events, receiver))
     }
 
     /// Given an event identifier, will fetch the details for the event it's
@@ -1752,7 +1751,12 @@ impl TimelineController {
 
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub(super) async fn retry_event_decryption(&self, session_ids: Option<BTreeSet<String>>) {
-        let (utds, decrypted) = self.compute_redecryption_candidates().await;
+        let (utds, decrypted) = match session_ids {
+            // An application retry is addressed to UTD sessions. It does not
+            // scan the timeline or schedule unrelated trust refresh work.
+            Some(session_ids) => (session_ids, BTreeSet::new()),
+            None => self.compute_redecryption_candidates().await,
+        };
 
         let request = DecryptionRetryRequest {
             room_id: self.room().room_id().to_owned(),

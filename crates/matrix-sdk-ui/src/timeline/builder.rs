@@ -180,7 +180,7 @@ impl TimelineBuilder {
             settings,
         );
 
-        let InitFocusResult { focus_task, has_events } =
+        let InitFocusResult { focus_task, retry_events } =
             controller.init_focus(&focus, &room_event_cache).await?;
 
         let room_update_join_handle = room
@@ -247,11 +247,13 @@ impl TimelineBuilder {
             }),
         };
 
-        if has_events {
+        if !retry_events.is_empty() {
             // The events we're injecting might be encrypted events, but we might
             // have received the room key to decrypt them while nobody was listening to the
             // `m.room_key` event, let's retry now.
-            timeline.retry_decryption_for_all_events().await;
+            room.client()
+                .event_cache()
+                .request_decryption_for_loaded_events(room.room_id(), retry_events);
         }
 
         Ok(timeline)

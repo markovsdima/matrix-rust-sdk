@@ -17,8 +17,6 @@ use std::collections::BTreeSet;
 
 use as_variant::as_variant;
 use eyeball_im::VectorDiff;
-#[cfg(feature = "e2e-encryption")]
-use matrix_sdk_base::deserialized_responses::TimelineEventKind;
 pub use matrix_sdk_base::event_cache::{Event, Gap};
 use matrix_sdk_base::{
     event_cache::store::DEFAULT_CHUNK_CAPACITY,
@@ -34,7 +32,7 @@ use matrix_sdk_common::linked_chunk::{
 use tracing::{instrument, trace};
 
 #[cfg(feature = "e2e-encryption")]
-use crate::event_cache::redecryptor::ResolvedUtd;
+use crate::event_cache::redecryptor::{ResolvedUtd, apply_resolved_utd};
 
 /// This type represents a linked chunk of events for a single room or thread.
 #[derive(Debug)]
@@ -475,15 +473,16 @@ impl EventLinkedChunk {
     /// Try to locate the events in the linked chunk corresponding to the given
     /// list of decrypted events, and replace them.
     ///
-    /// Returns true if at least one event has been replaced, false otherwise.
+    /// Returns the IDs actually replaced, excluding snapshots that became redacted.
     #[cfg(feature = "e2e-encryption")]
-    pub fn replace_utds(&mut self, events: &[ResolvedUtd]) -> bool {
+    pub fn replace_utds(&mut self, events: &[ResolvedUtd]) -> BTreeSet<ruma::OwnedEventId> {
         let event_set =
             self.events().filter_map(|(_pos, ev)| ev.event_id()).collect::<BTreeSet<_>>();
 
-        let mut replaced_some = false;
+        let mut replaced_ids = BTreeSet::new();
 
-        for (event_id, decrypted, actions) in events {
+        for resolved in events {
+            let event_id = &resolved.0;
             // As a performance optimization, do a lookup in the current pinned events
             // check, before looking for the event in the linked chunk.
 
@@ -496,19 +495,17 @@ impl EventLinkedChunk {
                 continue;
             };
 
-            target_event.kind = TimelineEventKind::Decrypted(decrypted.clone());
-
-            if let Some(actions) = actions {
-                target_event.set_push_actions(actions.clone());
+            if !apply_resolved_utd(resolved, &mut target_event) {
+                continue;
             }
 
             self.replace_event_at(position, target_event.clone())
                 .expect("position should be valid");
 
-            replaced_some = true;
+            replaced_ids.insert(event_id.clone());
         }
 
-        replaced_some
+        replaced_ids
     }
 
     /// Return the first chunk as a gap, if it's one.

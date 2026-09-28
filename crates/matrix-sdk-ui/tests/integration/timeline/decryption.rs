@@ -328,26 +328,30 @@ async fn test_an_utd_from_the_event_cache_as_a_paginated_item_is_decrypted() {
         });
     });
 
-    // Now, let's look at the updates. We must observe an update reflecting the UTD
-    // has entered the `Timeline`.
-    assert_next_matches_with_timeout!(updates_stream, 250, updates => {
-        assert_eq!(updates.len(), 2, "Expecting 2 updates from the `Timeline`");
-
-        // UTD! UTD!
-        assert_matches!(&updates[0], VectorDiff::Insert { index: 2, value: event } => {
-            assert_matches!(event.as_event(), Some(event) => {
-                assert_eq!(event.event_id().unwrap().as_str(), "$ev0");
-                assert!(event.content().is_unable_to_decrypt());
-            });
+    // The insertion and its asynchronous decryption can be delivered in one
+    // batch or separate batches. Require both ordinary diffs in order.
+    let mut event_updates = Vec::new();
+    while event_updates.len() < 2 {
+        assert_next_matches_with_timeout!(updates_stream, 250, updates => {
+            event_updates.extend(updates);
         });
+    }
+    assert_eq!(event_updates.len(), 2, "UTD insertion followed by decryption");
 
-        // UTD is decrypted now!
-        assert_matches!(&updates[1], VectorDiff::Set { index: 2, value: event } => {
-            assert_matches!(event.as_event(), Some(event) => {
-                assert_eq!(event.event_id().unwrap().as_str(), "$ev0");
-                assert_matches!(event.content().as_message(), Some(message) => {
-                    assert_eq!(message.body(), "It's a secret to everybody");
-                });
+    // UTD! UTD!
+    assert_matches!(&event_updates[0], VectorDiff::Insert { index: 2, value: event } => {
+        assert_matches!(event.as_event(), Some(event) => {
+            assert_eq!(event.event_id().unwrap().as_str(), "$ev0");
+            assert!(event.content().is_unable_to_decrypt());
+        });
+    });
+
+    // UTD is decrypted now!
+    assert_matches!(&event_updates[1], VectorDiff::Set { index: 2, value: event } => {
+        assert_matches!(event.as_event(), Some(event) => {
+            assert_eq!(event.event_id().unwrap().as_str(), "$ev0");
+            assert_matches!(event.content().as_message(), Some(message) => {
+                assert_eq!(message.body(), "It's a secret to everybody");
             });
         });
     });

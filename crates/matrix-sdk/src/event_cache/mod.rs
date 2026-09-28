@@ -226,6 +226,10 @@ impl EventCache {
                 linked_chunk_update_sender,
                 #[cfg(feature = "e2e-encryption")]
                 redecryption_channels,
+                #[cfg(all(feature = "e2e-encryption", any(test, feature = "testing")))]
+                redecryption_pause: Default::default(),
+                #[cfg(all(feature = "e2e-encryption", any(test, feature = "testing")))]
+                redecryption_test_state: Default::default(),
                 automatic_pagination: OnceLock::new(),
                 thread_subscriber_sender,
             }),
@@ -524,6 +528,13 @@ struct EventCacheInner {
 
     #[cfg(feature = "e2e-encryption")]
     redecryption_channels: redecryptor::RedecryptorChannels,
+
+    #[cfg(all(feature = "e2e-encryption", any(test, feature = "testing")))]
+    redecryption_pause:
+        Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
+
+    #[cfg(all(feature = "e2e-encryption", any(test, feature = "testing")))]
+    redecryption_test_state: redecryptor::RedecryptionTestState,
 
     /// State for the automatic pagination mechanism.
     ///

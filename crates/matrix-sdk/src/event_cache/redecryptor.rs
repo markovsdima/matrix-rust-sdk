@@ -57,7 +57,7 @@
 //! subscribes to [`RedecryptorReport`] stream.
 //!
 //! ```markdown
-//! 
+//!
 //!      .----------------------.
 //!     |                        |
 //!     |      Beeb, boop!       |
@@ -116,7 +116,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     pin::Pin,
-    sync::Weak,
+    sync::{Arc, Weak},
+    time::Duration,
 };
 
 use as_variant::as_variant;
@@ -132,16 +133,17 @@ use matrix_sdk_base::{
     deserialized_responses::{DecryptedRoomEvent, TimelineEvent, TimelineEventKind},
     event_cache::store::EventCacheStoreLockState,
     locks::Mutex,
+    sleep::sleep,
     task_monitor::BackgroundTaskHandle,
     timer,
 };
-#[cfg(doc)]
 use matrix_sdk_common::deserialized_responses::EncryptionInfo;
 use ruma::{
     OwnedEventId, OwnedRoomId, RoomId,
     events::{AnySyncTimelineEvent, room::encrypted::OriginalSyncRoomEncryptedEvent},
     push::Action,
     serde::Raw,
+    time::Instant,
 };
 use tokio::sync::{
     broadcast::{self, Sender},
@@ -166,8 +168,51 @@ type OwnedSessionId = String;
 
 type EventIdAndUtd = (OwnedEventId, Raw<AnySyncTimelineEvent>);
 type EventIdAndEvent = (OwnedEventId, DecryptedRoomEvent);
+
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+pub(super) struct RedecryptionTestState {
+    refresh_queries: std::sync::atomic::AtomicUsize,
+    info_queries: std::sync::atomic::AtomicUsize,
+    pause_refresh: tokio::sync::Mutex<
+        Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    >,
+}
+
+/// Operation counts, rather than elapsed time, for redecryption regressions.
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RedecryptionTestStats {
+    pub refresh_queries: usize,
+    pub info_queries: usize,
+}
 pub(in crate::event_cache) type ResolvedUtd =
     (OwnedEventId, DecryptedRoomEvent, Option<Vec<Action>>);
+
+/// Work can outlive its source snapshot. Keep redactions and newer decrypted
+/// content intact, including bundled relations; only refresh its metadata.
+pub(in crate::event_cache) fn apply_resolved_utd(
+    (_, decrypted, actions): &ResolvedUtd,
+    target: &mut TimelineEvent,
+) -> bool {
+    if target.raw().deserialize().is_ok_and(|event| event.is_redacted()) {
+        return false;
+    }
+    match &mut target.kind {
+        TimelineEventKind::UnableToDecrypt { .. } => {
+            target.kind = TimelineEventKind::Decrypted(decrypted.clone());
+            if let Some(actions) = actions {
+                target.set_push_actions(actions.clone());
+            }
+        }
+        TimelineEventKind::Decrypted(current) => {
+            current.encryption_info = decrypted.encryption_info.clone();
+        }
+        TimelineEventKind::PlainText { .. } => return false,
+    }
+    true
+}
 
 /// The information sent across the channel to the long-running task requesting
 /// that the supplied set of sessions be retried.
@@ -180,6 +225,12 @@ pub struct DecryptionRetryRequest {
     /// Events that are decrypted but might need to have their
     /// [`EncryptionInfo`] refreshed.
     pub refresh_info_session_ids: BTreeSet<OwnedSessionId>,
+}
+
+pub(super) enum DecryptionRetryCommand {
+    Wake,
+    #[cfg(any(test, feature = "testing"))]
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 /// A report coming from the redecryptor.
@@ -204,9 +255,10 @@ pub enum RedecryptorReport {
 
 pub(super) struct RedecryptorChannels {
     utd_reporter: Sender<RedecryptorReport>,
-    pub(super) decryption_request_sender: UnboundedSender<DecryptionRetryRequest>,
+    pub(super) decryption_request_sender: UnboundedSender<DecryptionRetryCommand>,
     pub(super) decryption_request_receiver:
-        Mutex<Option<UnboundedReceiver<DecryptionRetryRequest>>>,
+        Mutex<Option<UnboundedReceiver<DecryptionRetryCommand>>>,
+    pending: Mutex<PendingRequests>,
 }
 
 impl RedecryptorChannels {
@@ -218,6 +270,339 @@ impl RedecryptorChannels {
             utd_reporter,
             decryption_request_sender,
             decryption_request_receiver: Mutex::new(Some(decryption_request_receiver)),
+            pending: Default::default(),
+        }
+    }
+
+    fn enqueue(&self, update: impl FnOnce(&mut PendingRequests)) {
+        let wake = {
+            let mut pending = self.pending.lock();
+            let was_empty = pending.is_empty();
+            update(&mut pending);
+            was_empty && !pending.is_empty()
+        };
+        if wake {
+            let _ = self.decryption_request_sender.send(DecryptionRetryCommand::Wake).inspect_err(
+                |_| warn!("Requesting a decryption while the redecryption task has been shut down"),
+            );
+        }
+    }
+}
+
+/// Merge requests before waking the worker, so pagination cannot accumulate a
+/// FIFO of increasingly large copies of the same room's session sets.
+#[derive(Default)]
+struct PendingRequests {
+    rooms: BTreeMap<OwnedRoomId, DecryptionRetryRequest>,
+    loaded: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, TimelineEvent>>,
+}
+
+impl PendingRequests {
+    fn is_empty(&self) -> bool {
+        self.rooms.is_empty() && self.loaded.is_empty()
+    }
+
+    fn insert(&mut self, request: DecryptionRetryRequest) {
+        if request.utd_session_ids.is_empty() && request.refresh_info_session_ids.is_empty() {
+            return;
+        }
+        let current =
+            self.rooms.entry(request.room_id.clone()).or_insert_with(|| DecryptionRetryRequest {
+                room_id: request.room_id.clone(),
+                utd_session_ids: Default::default(),
+                refresh_info_session_ids: Default::default(),
+            });
+        current.utd_session_ids.extend(request.utd_session_ids);
+        // A session can contain both UTD and decrypted events. Keep its refresh
+        // pending after the UTD instead of dropping the trust update.
+        current.refresh_info_session_ids.extend(request.refresh_info_session_ids);
+    }
+}
+
+const REDECRYPTION_BATCH_SIZE: usize = 32;
+const MAX_INPUTS_BETWEEN_BATCHES: usize = 32;
+const MAX_UTD_BATCHES_BEFORE_REFRESH: usize = 8;
+const MAX_BATCH_ATTEMPTS: usize = 3;
+const BATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+enum RedecryptionBatch {
+    LoadUtds { room: OwnedRoomId, session: OwnedSessionId },
+    Decrypt { room: OwnedRoomId, events: Vec<EventIdAndUtd> },
+    LoadRefresh { room: OwnedRoomId, session: OwnedSessionId },
+    Refresh { room: OwnedRoomId, events: Vec<EventIdAndEvent> },
+}
+
+impl RedecryptionBatch {
+    fn is_utd(&self) -> bool {
+        matches!(self, Self::LoadUtds { .. } | Self::Decrypt { .. })
+    }
+}
+
+struct FailedBatch {
+    batch: RedecryptionBatch,
+    attempts: usize,
+    retry_at: Instant,
+}
+
+/// Work is deduplicated by room/session or room/event, and each event batch
+/// yields back to input handling. Rooms rotate even while one has a long tail.
+#[derive(Default)]
+struct RedecryptionWork {
+    utd_sessions: BTreeMap<OwnedRoomId, BTreeSet<OwnedSessionId>>,
+    utd_events: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, Raw<AnySyncTimelineEvent>>>,
+    refresh_sessions: BTreeMap<OwnedRoomId, BTreeSet<OwnedSessionId>>,
+    refresh_events: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, DecryptedRoomEvent>>,
+    last_utd_room: Option<OwnedRoomId>,
+    last_refresh_room: Option<OwnedRoomId>,
+    load_utds_next: bool,
+    load_refresh_next: bool,
+    consecutive_utd_batches: usize,
+    failed_batches: Vec<FailedBatch>,
+    #[cfg(any(test, feature = "testing"))]
+    barriers: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn next_room<T>(
+    rooms: &BTreeMap<OwnedRoomId, T>,
+    previous: &Option<OwnedRoomId>,
+) -> Option<OwnedRoomId> {
+    previous
+        .as_ref()
+        .and_then(|previous| {
+            rooms
+                .range((std::ops::Bound::Excluded(previous.clone()), std::ops::Bound::Unbounded))
+                .next()
+                .map(|(room, _)| room.clone())
+        })
+        .or_else(|| rooms.first_key_value().map(|(room, _)| room.clone()))
+}
+
+fn take_event_batch<T>(
+    rooms: &mut BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, T>>,
+    previous: &mut Option<OwnedRoomId>,
+) -> Option<(OwnedRoomId, Vec<(OwnedEventId, T)>)> {
+    let room = next_room(rooms, previous)?;
+    let events = rooms.get_mut(&room).expect("selected room");
+    let batch = (0..REDECRYPTION_BATCH_SIZE).filter_map(|_| events.pop_first()).collect();
+    if events.is_empty() {
+        rooms.remove(&room);
+    }
+    *previous = Some(room.clone());
+    Some((room, batch))
+}
+
+impl RedecryptionWork {
+    fn is_empty(&self) -> bool {
+        !self.has_ready_work() && self.failed_batches.is_empty()
+    }
+
+    fn has_ready_work(&self) -> bool {
+        !self.utd_sessions.is_empty()
+            || !self.utd_events.is_empty()
+            || !self.refresh_sessions.is_empty()
+            || !self.refresh_events.is_empty()
+    }
+
+    fn has_runnable_work(&self) -> bool {
+        self.has_ready_work()
+            || self.failed_batches.iter().any(|batch| batch.retry_at <= Instant::now())
+    }
+
+    async fn wait_for_work(&self) {
+        if self.has_ready_work() {
+            tokio::task::yield_now().await;
+        } else if let Some(retry_at) = self.failed_batches.iter().map(|batch| batch.retry_at).min()
+        {
+            sleep(retry_at.saturating_duration_since(Instant::now())).await;
+        }
+    }
+
+    fn has_refresh_work(&self) -> bool {
+        !self.refresh_sessions.is_empty()
+            || !self.refresh_events.is_empty()
+            || self
+                .failed_batches
+                .iter()
+                .any(|batch| !batch.batch.is_utd() && batch.retry_at <= Instant::now())
+    }
+
+    fn take_failed_batch(&mut self, utd: bool) -> Option<(RedecryptionBatch, usize)> {
+        let now = Instant::now();
+        let index = self
+            .failed_batches
+            .iter()
+            .position(|batch| batch.batch.is_utd() == utd && batch.retry_at <= now)?;
+        let failed = self.failed_batches.remove(index);
+        Some((failed.batch, failed.attempts))
+    }
+
+    fn take_batch(&mut self) -> Option<(RedecryptionBatch, usize)> {
+        // UTDs normally go first. Under a continuous UTD stream, let one
+        // refresh portion progress too, so trust updates cannot starve forever.
+        let utds_first = !self.has_refresh_work()
+            || self.consecutive_utd_batches < MAX_UTD_BATCHES_BEFORE_REFRESH;
+        if utds_first {
+            if let Some(batch) = self.take_failed_batch(true) {
+                self.consecutive_utd_batches += 1;
+                return Some(batch);
+            }
+            if !self.utd_sessions.is_empty() && (self.utd_events.is_empty() || self.load_utds_next)
+            {
+                self.consecutive_utd_batches += 1;
+                let room = next_room(&self.utd_sessions, &self.last_utd_room)?;
+                let pending = self.utd_sessions.get_mut(&room)?;
+                let session = pending.pop_first()?;
+                if pending.is_empty() {
+                    self.utd_sessions.remove(&room);
+                }
+                self.last_utd_room = Some(room.clone());
+                self.load_utds_next = false;
+                return Some((RedecryptionBatch::LoadUtds { room, session }, 0));
+            }
+            if let Some((room, events)) =
+                take_event_batch(&mut self.utd_events, &mut self.last_utd_room)
+            {
+                self.consecutive_utd_batches += 1;
+                self.load_utds_next = true;
+                return Some((RedecryptionBatch::Decrypt { room, events }, 0));
+            }
+        }
+        if let Some(batch) = self.take_failed_batch(false) {
+            self.consecutive_utd_batches = 0;
+            return Some(batch);
+        }
+        if !self.refresh_sessions.is_empty()
+            && (self.refresh_events.is_empty() || self.load_refresh_next)
+        {
+            self.consecutive_utd_batches = 0;
+            let room = next_room(&self.refresh_sessions, &self.last_refresh_room)?;
+            let sessions = self.refresh_sessions.get_mut(&room)?;
+            let session = sessions.pop_first()?;
+            if sessions.is_empty() {
+                self.refresh_sessions.remove(&room);
+            }
+            self.last_refresh_room = Some(room.clone());
+            self.load_refresh_next = false;
+            return Some((RedecryptionBatch::LoadRefresh { room, session }, 0));
+        }
+        if let Some((room, events)) =
+            take_event_batch(&mut self.refresh_events, &mut self.last_refresh_room)
+        {
+            self.consecutive_utd_batches = 0;
+            self.load_refresh_next = true;
+            return Some((RedecryptionBatch::Refresh { room, events }, 0));
+        }
+        None
+    }
+
+    fn merge(&mut self, pending: PendingRequests) {
+        for (room, request) in pending.rooms {
+            if !request.utd_session_ids.is_empty() {
+                self.utd_sessions.entry(room.clone()).or_default().extend(request.utd_session_ids);
+            }
+            if !request.refresh_info_session_ids.is_empty() {
+                self.refresh_sessions
+                    .entry(room)
+                    .or_default()
+                    .extend(request.refresh_info_session_ids);
+            }
+        }
+        for (room, events) in pending.loaded {
+            self.add_loaded_events(&room, events.into_values());
+        }
+    }
+
+    async fn execute_batch(
+        &mut self,
+        cache: &EventCache,
+        batch: &RedecryptionBatch,
+    ) -> Result<(), EventCacheError> {
+        match batch {
+            RedecryptionBatch::LoadUtds { room, session } => {
+                let events = cache.get_utds(room, session).await?;
+                trace!(
+                    requested_sessions = 1,
+                    selected_events = events.len(),
+                    "Selected UTD retry events"
+                );
+                // Newer directly loaded snapshots win over a delayed store query.
+                let pending = self.utd_events.entry(room.clone()).or_default();
+                for (id, event) in events {
+                    pending.entry(id).or_insert(event);
+                }
+                if pending.is_empty() {
+                    self.utd_events.remove(room);
+                }
+                Ok(())
+            }
+            RedecryptionBatch::Decrypt { room, events } => {
+                cache.retry_decryption_for_events(room, events.clone()).await
+            }
+            RedecryptionBatch::LoadRefresh { room, session } => {
+                let events = cache.get_decrypted_events(room, session).await?;
+                let pending = self.refresh_events.entry(room.clone()).or_default();
+                for (id, event) in events {
+                    pending.entry(id).or_insert(event);
+                }
+                if pending.is_empty() {
+                    self.refresh_events.remove(room);
+                }
+                Ok(())
+            }
+            RedecryptionBatch::Refresh { room, events } => {
+                if let Some(room) =
+                    cache.inner.client().ok().and_then(|client| client.get_room(room))
+                {
+                    cache.update_encryption_info_for_events(&room, events.clone()).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn run_batch(&mut self, cache: &EventCache) -> Result<(), EventCacheError> {
+        let Some((batch, previous_attempts)) = self.take_batch() else {
+            return Ok(());
+        };
+        let result = self.execute_batch(cache, &batch).await;
+        if let Err(error) = &result {
+            let attempts = previous_attempts + 1;
+            if attempts < MAX_BATCH_ATTEMPTS {
+                warn!(attempts, ?error, "Redecryption batch failed; scheduling a bounded retry");
+                self.failed_batches.push(FailedBatch {
+                    batch,
+                    attempts,
+                    retry_at: Instant::now() + BATCH_RETRY_DELAY * attempts as u32,
+                });
+            } else {
+                warn!(attempts, ?error, "Redecryption batch failed; retry limit reached");
+            }
+        }
+        result
+    }
+
+    fn add_loaded_events(
+        &mut self,
+        room: &RoomId,
+        events: impl IntoIterator<Item = TimelineEvent>,
+    ) {
+        for event in events {
+            if matches!(event.kind, TimelineEventKind::Decrypted(_)) {
+                if let Some((id, decrypted)) = filter_timeline_event_to_decrypted(event) {
+                    self.refresh_events.entry(room.to_owned()).or_default().insert(id, decrypted);
+                }
+            } else if let Some((id, raw)) = filter_timeline_event_to_utd(event) {
+                self.utd_events.entry(room.to_owned()).or_default().insert(id, raw);
+            }
+        }
+    }
+
+    fn add_chunk_update(&mut self, update: RoomEventCacheLinkedChunkUpdate) {
+        let room = update.linked_chunk_id.room_id();
+        for event in update.updates.into_iter().flat_map(|update| update.into_items()) {
+            if let Some((id, raw)) = filter_timeline_event_to_utd(event) {
+                self.utd_events.entry(room.to_owned()).or_default().insert(id, raw);
+            }
         }
     }
 }
@@ -306,6 +691,11 @@ impl EventCache {
         room_id: &RoomId,
         session_id: SessionId<'_>,
     ) -> Result<Vec<EventIdAndEvent>, EventCacheError> {
+        #[cfg(any(test, feature = "testing"))]
+        self.inner
+            .redecryption_test_state
+            .refresh_queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let events = match self.inner.store.lock().await? {
             // If the lock is clean, no problem.
             // If the lock is dirty, it doesn't really matter as we are hitting the store
@@ -366,8 +756,7 @@ impl EventCache {
         // Get the cache for this particular room.
         let (room_cache, _drop_handles) = self.for_room(room_id).await?;
 
-        let event_ids: BTreeSet<_> =
-            events.iter().cloned().map(|(event_id, _, _)| event_id).collect();
+        let mut event_ids = BTreeSet::new();
 
         // Phase 1: under the room state write lock, collect cache handles and
         // perform all room-linked-chunk mutations. We deliberately do NOT call
@@ -383,18 +772,17 @@ impl EventCache {
 
             // Consider the room linked chunk.
             let mut new_events = Vec::with_capacity(events.len());
-            for (event_id, decrypted, actions) in &events {
-                if let Some((location, mut target_event)) = state.find_event(event_id).await? {
-                    target_event.kind = TimelineEventKind::Decrypted(decrypted.clone());
-
-                    if let Some(actions) = actions {
-                        target_event.set_push_actions(actions.clone());
+            for resolved in &events {
+                if let Some((location, mut target_event)) = state.find_event(&resolved.0).await? {
+                    if !apply_resolved_utd(resolved, &mut target_event) {
+                        continue;
                     }
 
                     // TODO: `replace_event_at()` propagates changes to the store for every
                     // event, we should probably have a bulk version of this?
                     state.replace_event_at(location, target_event.clone()).await?;
                     new_events.push(target_event);
+                    event_ids.insert(resolved.0.clone());
                 }
             }
 
@@ -431,18 +819,22 @@ impl EventCache {
         // holding the room state lock. These caches have their own internal
         // locks and don't need the room state lock.
         if let Some(pinned_cache) = pinned_cache {
-            pinned_cache.replace_utds(&events).await?;
+            event_ids.extend(pinned_cache.replace_utds(&events).await?);
         }
 
         // TODO: This ain't great for performance; there shouldn't be that many
         // event-focused caches alive at the same time, but they could
         // accumulate over time. Consider keeping track of which linked chunk
         // contain which event id, to avoid doing the linear searches here.
-        join_all(ef_caches.iter().map(|cache| cache.replace_utds(&events))).await;
+        for replaced in join_all(ef_caches.iter().map(|cache| cache.replace_utds(&events))).await {
+            event_ids.extend(replaced);
+        }
 
-        let report =
-            RedecryptorReport::ResolvedUtds { room_id: room_id.to_owned(), events: event_ids };
-        let _ = self.inner.redecryption_channels.utd_reporter.send(report);
+        if !event_ids.is_empty() {
+            let report =
+                RedecryptorReport::ResolvedUtds { room_id: room_id.to_owned(), events: event_ids };
+            let _ = self.inner.redecryption_channels.utd_reporter.send(report);
+        }
 
         Ok(())
     }
@@ -499,46 +891,6 @@ impl EventCache {
         }
     }
 
-    /// Attempt to redecrypt events after a room key with the given session ID
-    /// has been received.
-    #[instrument(skip_all, fields(room_id, session_id))]
-    async fn retry_decryption(
-        &self,
-        room_id: &RoomId,
-        session_id: SessionId<'_>,
-    ) -> Result<(), EventCacheError> {
-        // Get all the relevant UTDs.
-        let events = self.get_utds(room_id, session_id).await?;
-        self.retry_decryption_for_events(room_id, events).await
-    }
-
-    /// Attempt to redecrypt events that were persisted in the event cache.
-    #[instrument(skip_all, fields(updates.linked_chunk_id))]
-    async fn retry_decryption_for_event_cache_updates(
-        &self,
-        updates: RoomEventCacheLinkedChunkUpdate,
-    ) -> Result<(), EventCacheError> {
-        let room_id = updates.linked_chunk_id.room_id();
-        let events: Vec<_> = updates
-            .updates
-            .into_iter()
-            .flat_map(|updates| updates.into_items())
-            .filter_map(filter_timeline_event_to_utd)
-            .collect();
-
-        self.retry_decryption_for_events(room_id, events).await
-    }
-
-    async fn retry_decryption_for_in_memory_events(&self) {
-        let utds = self.get_utds_from_memory().await;
-
-        for (room_id, utds) in utds.into_iter() {
-            if let Err(e) = self.retry_decryption_for_events(&room_id, utds).await {
-                warn!(%room_id, "Failed to redecrypt in-memory events {e:?}");
-            }
-        }
-    }
-
     /// Attempt to redecrypt a chunk of UTDs.
     #[instrument(skip_all, fields(room_id, session_id))]
     async fn retry_decryption_for_events(
@@ -557,7 +909,8 @@ impl EventCache {
         let push_context =
             if let Some(room) = &room { room.push_context().await.ok().flatten() } else { None };
 
-        // Let's attempt to decrypt them them.
+        let selected_events = events.len();
+        // Attempt decryption without retaining payloads or IDs for diagnostics.
         let mut decrypted_events = Vec::with_capacity(events.len());
 
         for (event_id, event) in events {
@@ -576,11 +929,19 @@ impl EventCache {
             }
         }
 
-        let event_ids: BTreeSet<_> =
-            decrypted_events.iter().map(|(event_id, _, _)| event_id).collect();
+        trace!(
+            selected_events,
+            decrypted_events = decrypted_events.len(),
+            "Finished decryption attempts"
+        );
 
-        if !event_ids.is_empty() {
-            trace!(?event_ids, "Successfully redecrypted events");
+        #[cfg(any(test, feature = "testing"))]
+        if !decrypted_events.is_empty() {
+            let pause = self.inner.redecryption_pause.lock().await.take();
+            if let Some((reached, resume)) = pause {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
         }
 
         // Replace the events and notify listeners that UTDs have been replaced with
@@ -598,11 +959,33 @@ impl EventCache {
     ) -> Result<(), EventCacheError> {
         // Let's attempt to update their encryption info.
         let mut updated_events = Vec::with_capacity(events.len());
+        let mut info_by_sender: BTreeMap<(String, ruma::OwnedUserId), Option<Arc<EncryptionInfo>>> =
+            BTreeMap::new();
 
         for (event_id, mut event) in events {
             if let Some(session_id) = event.encryption_info.session_id() {
-                let new_encryption_info =
-                    room.get_encryption_info(session_id, &event.encryption_info.sender).await;
+                let key = (session_id.to_owned(), event.encryption_info.sender.clone());
+                let new_encryption_info = if let Some(info) = info_by_sender.get(&key) {
+                    info.clone()
+                } else {
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        let pause =
+                            self.inner.redecryption_test_state.pause_refresh.lock().await.take();
+                        if let Some((reached, resume)) = pause {
+                            let _ = reached.send(());
+                            let _ = resume.await;
+                        }
+                        self.inner
+                            .redecryption_test_state
+                            .info_queries
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let info =
+                        room.get_encryption_info(session_id, &event.encryption_info.sender).await;
+                    info_by_sender.insert(key, info.clone());
+                    info
+                };
 
                 // Only create a replacement if the encryption info actually changed.
                 if let Some(new_encryption_info) = new_encryption_info
@@ -614,74 +997,9 @@ impl EventCache {
             }
         }
 
-        let event_ids: BTreeSet<_> =
-            updated_events.iter().map(|(event_id, _, _)| event_id).collect();
-
-        if !event_ids.is_empty() {
-            trace!(?event_ids, "Replacing the encryption info of some events");
-        }
+        trace!(replacement_count = updated_events.len(), "Finished encryption-info refresh");
 
         self.on_resolved_utds(room.room_id(), updated_events).await
-    }
-
-    #[instrument(skip_all, fields(room_id, session_id))]
-    async fn update_encryption_info(
-        &self,
-        room_id: &RoomId,
-        session_id: SessionId<'_>,
-    ) -> Result<(), EventCacheError> {
-        trace!("Updating encryption info");
-
-        let Ok(client) = self.inner.client() else {
-            return Ok(());
-        };
-
-        let Some(room) = client.get_room(room_id) else {
-            return Ok(());
-        };
-
-        // Get all the relevant events.
-        let events = self.get_decrypted_events(room_id, session_id).await?;
-
-        if events.is_empty() {
-            trace!("No relevant events found.");
-            return Ok(());
-        }
-
-        // Let's attempt to update their encryption info.
-        self.update_encryption_info_for_events(&room, events).await
-    }
-
-    async fn retry_update_encryption_info_for_in_memory_events(&self) {
-        let decrypted_events = self.get_decrypted_events_from_memory().await;
-
-        for (room_id, events) in decrypted_events.into_iter() {
-            let Some(room) = self.inner.client().ok().and_then(|c| c.get_room(&room_id)) else {
-                continue;
-            };
-
-            if let Err(e) = self.update_encryption_info_for_events(&room, events).await {
-                warn!(
-                    %room_id,
-                    "Failed to replace the encryption info for in-memory events {e:?}"
-                );
-            }
-        }
-    }
-
-    /// Retry to decrypt and update the encryption info of all the events
-    /// contained in the memory part of the event cache.
-    ///
-    /// This list of events will map one-to-one to the events components
-    /// subscribed to the event cache are have received and are keeping cached.
-    ///
-    /// If components subscribed to the event cache are doing additional
-    /// caching, they'll need to listen to [RedecryptorReport]s and
-    /// explicitly request redecryption attempts using
-    /// [EventCache::request_decryption].
-    async fn retry_in_memory_events(&self) {
-        self.retry_decryption_for_in_memory_events().await;
-        self.retry_update_encryption_info_for_in_memory_events().await;
     }
 
     /// Explicitly request the redecryption of a set of events.
@@ -725,10 +1043,99 @@ impl EventCache {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn request_decryption(&self, request: DecryptionRetryRequest) {
-        let _ =
-            self.inner.redecryption_channels.decryption_request_sender.send(request).inspect_err(
-                |_| warn!("Requesting a decryption while the redecryption task has been shut down"),
-            );
+        self.inner.redecryption_channels.enqueue(|pending| pending.insert(request));
+    }
+
+    /// Retry events newly loaded from cache without querying all persisted
+    /// events of their sessions. Callers must only supply inserted/reloaded
+    /// events, not the worker's own encryption-info replacement diffs.
+    #[doc(hidden)]
+    pub fn request_decryption_for_loaded_events(
+        &self,
+        room_id: &RoomId,
+        events: impl IntoIterator<Item = TimelineEvent>,
+    ) {
+        let events: BTreeMap<_, _> = events
+            .into_iter()
+            .filter_map(|event| {
+                if matches!(
+                    event.kind,
+                    TimelineEventKind::Decrypted(_) | TimelineEventKind::UnableToDecrypt { .. }
+                ) {
+                    event.event_id().map(|id| (id, event))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !events.is_empty() {
+            self.inner.redecryption_channels.enqueue(|pending| {
+                pending.loaded.entry(room_id.to_owned()).or_default().extend(events);
+            });
+        }
+    }
+
+    /// Wait for earlier explicit retries and queued linked-chunk updates.
+    ///
+    /// Tests must stop producing updates before using this barrier. It does not
+    /// wait for unrelated sync or key-recovery tasks.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn redecryptor_barrier_for_testing(&self) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            self.inner
+                .redecryption_channels
+                .decryption_request_sender
+                .send(DecryptionRetryCommand::Barrier(sender))
+                .is_ok()
+        );
+        receiver.await.expect("redecryptor stopped before reaching the barrier");
+    }
+
+    /// Pause one successful retry after decryption, before it applies changes.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn pause_next_redecryption_for_testing(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached_sender, reached_receiver) = tokio::sync::oneshot::channel();
+        let (resume_sender, resume_receiver) = tokio::sync::oneshot::channel();
+        *self.inner.redecryption_pause.lock().await = Some((reached_sender, resume_receiver));
+        (reached_receiver, resume_sender)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn pause_next_refresh_for_testing(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached_sender, reached_receiver) = tokio::sync::oneshot::channel();
+        let (resume_sender, resume_receiver) = tokio::sync::oneshot::channel();
+        *self.inner.redecryption_test_state.pause_refresh.lock().await =
+            Some((reached_sender, resume_receiver));
+        (reached_receiver, resume_sender)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn redecryption_stats_for_testing(&self) -> RedecryptionTestStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        RedecryptionTestStats {
+            refresh_queries: self.inner.redecryption_test_state.refresh_queries.load(Relaxed),
+            info_queries: self.inner.redecryption_test_state.info_queries.load(Relaxed),
+        }
+    }
+
+    /// Model account retirement after a retry has started.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn abort_redecryptor_for_testing(&self) {
+        let worker = &self.inner.drop_handles.get().expect("subscribed")._redecryptor._task;
+        worker.abort();
+        while !worker.is_finished() {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Subscribe to reports that the redecryptor generates.
@@ -793,15 +1200,25 @@ fn upgrade_event_cache(cache: &Weak<EventCacheInner>) -> Option<EventCache> {
     cache.upgrade().map(|inner| EventCache { inner })
 }
 
-async fn send_report_and_retry_memory_events(
+async fn schedule_memory_events(
     cache: &Weak<EventCacheInner>,
+    work: &mut RedecryptionWork,
     report: RedecryptorReport,
 ) -> Result<(), ()> {
     let Some(cache) = upgrade_event_cache(cache) else {
         return Err(());
     };
 
-    cache.retry_in_memory_events().await;
+    for (room, events) in cache.get_utds_from_memory().await {
+        if !events.is_empty() {
+            work.utd_events.entry(room).or_default().extend(events);
+        }
+    }
+    for (room, events) in cache.get_decrypted_events_from_memory().await {
+        if !events.is_empty() {
+            work.refresh_events.entry(room).or_default().extend(events);
+        }
+    }
     let _ = cache.inner.redecryption_channels.utd_reporter.send(report);
 
     Ok(())
@@ -825,7 +1242,7 @@ impl Redecryptor {
     pub(super) fn new(
         client: &Client,
         cache: Weak<EventCacheInner>,
-        receiver: UnboundedReceiver<DecryptionRetryRequest>,
+        receiver: UnboundedReceiver<DecryptionRetryCommand>,
         linked_chunk_update_sender: &Sender<RoomEventCacheLinkedChunkUpdate>,
     ) -> Self {
         let linked_chunk_stream = BroadcastStream::new(linked_chunk_update_sender.subscribe());
@@ -870,188 +1287,130 @@ impl Redecryptor {
 
     async fn redecryption_loop(
         cache: &Weak<EventCacheInner>,
-        decryption_request_stream: &mut Pin<&mut impl Stream<Item = DecryptionRetryRequest>>,
+        decryption_request_stream: &mut Pin<&mut impl Stream<Item = DecryptionRetryCommand>>,
         events_stream: &mut Pin<
             &mut impl Stream<Item = Result<RoomEventCacheLinkedChunkUpdate, BroadcastStreamRecvError>>,
         >,
         backup_state_stream: &mut Pin<
             &mut impl Stream<Item = Result<BackupState, BroadcastStreamRecvError>>,
         >,
+        work: &mut RedecryptionWork,
     ) -> bool {
         let Some((room_key_stream, withheld_stream)) =
             Self::subscribe_to_room_key_stream(cache).await
         else {
             return false;
         };
-
         pin_mut!(room_key_stream);
         pin_mut!(withheld_stream);
+        let mut input_budget = MAX_INPUTS_BETWEEN_BATCHES;
 
         loop {
-            tokio::select! {
-                // An explicit request, presumably from the timeline, has been received to decrypt
-                // events that were encrypted with a certain room key.
-                Some(request) = decryption_request_stream.next() => {
-                        let Some(cache) = upgrade_event_cache(cache) else {
-                            break false;
-                        };
-
-                        trace!(?request, "Received a redecryption request");
-
-                        for session_id in request.utd_session_ids {
-                            let _ = cache
-                                .retry_decryption(&request.room_id, &session_id)
-                                .await
-                                .inspect_err(|e| warn!("Error redecrypting after an explicit request was received {e:?}"));
-                        }
-
-                        for session_id in request.refresh_info_session_ids {
-                            let _ = cache.update_encryption_info(&request.room_id, &session_id).await.inspect_err(|e|
-                                warn!(
-                                    room_id = %request.room_id,
-                                    session_id = session_id,
-                                    "Unable to update the encryption info {e:?}",
-                            ));
-                        }
+            #[cfg(any(test, feature = "testing"))]
+            if !work.barriers.is_empty() {
+                use futures_util::FutureExt as _;
+                let Some(cache) = upgrade_event_cache(cache) else {
+                    return false;
+                };
+                work.merge(std::mem::take(&mut *cache.inner.redecryption_channels.pending.lock()));
+                let mut drained = 0;
+                while drained < MAX_INPUTS_BETWEEN_BATCHES {
+                    let Some(Some(update)) = events_stream.next().now_or_never() else {
+                        break;
+                    };
+                    work.add_chunk_update(update.expect("test must not lag linked-chunk updates"));
+                    drained += 1;
                 }
-                // The room key stream from the OlmMachine. Needs to be recreated every time we
-                // receive a `None` from the stream.
-                room_keys = room_key_stream.next() => {
-                    match room_keys {
-                        Some(Ok(room_keys)) => {
-                            // Alright, some room keys were received and persisted in our store,
-                            // let's attempt to redecrypt events that were encrypted using these
-                            // room keys.
-                            let Some(cache) = upgrade_event_cache(cache) else {
-                                break false;
-                            };
-
-                            trace!(?room_keys, "Received new room keys");
-
-                            for key in &room_keys {
-                                let _ = cache
-                                    .retry_decryption(&key.room_id, &key.session_id)
-                                    .await
-                                    .inspect_err(|e| warn!("Error redecrypting {e:?}"));
-                            }
-
-                            for key in room_keys {
-                                let _ = cache.update_encryption_info(&key.room_id, &key.session_id).await.inspect_err(|e|
-                                    warn!(
-                                        room_id = %key.room_id,
-                                        session_id = key.session_id,
-                                        "Unable to update the encryption info {e:?}",
-                                ));
-                            }
-                        },
-                        Some(Err(_)) => {
-                            // We missed some room keys, we need to report this in case a listener
-                            // has and idea which UTDs we should attempt to redecrypt.
-                            //
-                            // This would most likely be the timeline from the UI crate. The
-                            // timeline might attempt to redecrypt all UTDs it is showing to the
-                            // user.
-                            warn!("The room key stream lagged, reporting the lag to our listeners");
-
-                            if send_report_and_retry_memory_events(cache, RedecryptorReport::Lagging).await.is_err() {
-                                break false;
-                            }
-                        },
-                        // The stream got closed, this could mean that our OlmMachine got
-                        // regenerated, let's return true and try to recreate the stream.
-                        None => {
-                            break true;
-                        }
+                if drained < MAX_INPUTS_BETWEEN_BATCHES && work.is_empty() {
+                    for barrier in std::mem::take(&mut work.barriers) {
+                        let _ = barrier.send(());
                     }
                 }
-                withheld_info = withheld_stream.next() => {
+            }
+            if !work.has_runnable_work() {
+                input_budget = MAX_INPUTS_BETWEEN_BATCHES;
+            }
+
+            // Inputs only enqueue work. At most one bounded work batch runs
+            // before checking new requests/keys again; an intake budget also
+            // guarantees refresh progress under a continuous input stream.
+            tokio::select! {
+                biased;
+                Some(command) = decryption_request_stream.next(), if input_budget > 0 => {
+                    input_budget -= 1;
+                    let Some(cache) = upgrade_event_cache(cache) else { return false; };
+                    match command {
+                        DecryptionRetryCommand::Wake => {
+                            let pending = std::mem::take(&mut *cache.inner.redecryption_channels.pending.lock());
+                            trace!(request_rooms = pending.rooms.len(), loaded_rooms = pending.loaded.len(), "Consumed coalesced redecryption requests");
+                            work.merge(pending);
+                        }
+                        #[cfg(any(test, feature = "testing"))]
+                        DecryptionRetryCommand::Barrier(sender) => work.barriers.push(sender),
+                    }
+                }
+                room_keys = room_key_stream.next(), if input_budget > 0 => {
+                    input_budget -= 1;
+                    match room_keys {
+                        Some(Ok(keys)) => {
+                            for key in keys {
+                                work.utd_sessions.entry(key.room_id.clone()).or_default().insert(key.session_id.clone());
+                                work.refresh_sessions.entry(key.room_id).or_default().insert(key.session_id);
+                            }
+                        }
+                        Some(Err(_)) => {
+                            warn!("The room key stream lagged, reporting the lag to our listeners");
+                            if schedule_memory_events(cache, work, RedecryptorReport::Lagging).await.is_err() { return false; }
+                        }
+                        None => return true,
+                    }
+                }
+                withheld_info = withheld_stream.next(), if input_budget > 0 => {
+                    input_budget -= 1;
                     match withheld_info {
                         Some(infos) => {
-                            let Some(cache) = upgrade_event_cache(cache) else {
-                                break false;
-                            };
-
-                            trace!(?infos, "Received new withheld infos");
-
-                            for RoomKeyWithheldInfo { room_id, session_id, .. } in &infos {
-                                let _ = cache.update_encryption_info(room_id, session_id).await.inspect_err(|e|
-                                    warn!(
-                                        room_id = %room_id,
-                                        session_id = session_id,
-                                        "Unable to update the encryption info {e:?}",
-                                ));
+                            for RoomKeyWithheldInfo { room_id, session_id, .. } in infos {
+                                work.refresh_sessions.entry(room_id).or_default().insert(session_id);
                             }
                         }
-                        // The stream got closed, same as for the room key stream, we'll try to
-                        // recreate the streams.
-                        None => break true,
+                        None => return true,
                     }
                 }
-                // Events that the event cache handled. If the event cache received any UTDs, let's
-                // attempt to redecrypt them in case the room key was received before the event
-                // cache was able to return them using `get_utds()`.
-                Some(event_updates) = events_stream.next() => {
-                    match event_updates {
-                        Ok(updates) => {
-                            let Some(cache) = upgrade_event_cache(cache) else {
-                                break false;
-                            };
-
-                            let linked_chunk_id = updates.linked_chunk_id.to_owned();
-
-                            let _ = cache.retry_decryption_for_event_cache_updates(updates).await.inspect_err(|e|
-                                warn!(
-                                    %linked_chunk_id,
-                                    "Unable to handle UTDs from event cache updates {e:?}",
-                                )
-                            );
-                        }
+                Some(updates) = events_stream.next(), if input_budget > 0 => {
+                    input_budget -= 1;
+                    match updates {
+                        Ok(update) => work.add_chunk_update(update),
                         Err(_) => {
-                            if send_report_and_retry_memory_events(cache, RedecryptorReport::Lagging).await.is_err() {
-                                break false;
-                            }
+                            if schedule_memory_events(cache, work, RedecryptorReport::Lagging).await.is_err() { return false; }
                         }
                     }
                 }
-                Some(backup_state_update) = backup_state_stream.next() => {
-                    match backup_state_update {
-                        Ok(state) => {
-                            match state {
-                                BackupState::Unknown |
-                                BackupState::Creating |
-                                BackupState::Enabling |
-                                BackupState::Resuming |
-                                BackupState::Downloading |
-                                BackupState::Disabling =>{
-                                    // Those states aren't particularly interesting to components
-                                    // listening to R2D2 reports.
-                                }
-                                BackupState::Enabled => {
-                                    // Alright, the backup got enabled, we might or might not have
-                                    // downloaded the room keys from the backup. In case they get
-                                    // downloaded on-demand, let's try to decrypt all the events we
-                                    // have cached in-memory.
-                                    if send_report_and_retry_memory_events(cache, RedecryptorReport::BackupAvailable).await.is_err() {
-                                        break false;
-                                    }
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            if send_report_and_retry_memory_events(cache, RedecryptorReport::Lagging).await.is_err() {
-                                break false;
-                            }
-                        }
+                Some(update) = backup_state_stream.next(), if input_budget > 0 => {
+                    input_budget -= 1;
+                    let report = match update {
+                        Ok(BackupState::Enabled) => Some(RedecryptorReport::BackupAvailable),
+                        Err(_) => Some(RedecryptorReport::Lagging),
+                        _ => None,
+                    };
+                    if let Some(report) = report {
+                        if schedule_memory_events(cache, work, report).await.is_err() { return false; }
                     }
                 }
-                else => break false,
+                _ = work.wait_for_work(), if !work.is_empty() => {
+                    input_budget = MAX_INPUTS_BETWEEN_BATCHES;
+                    let Some(cache) = upgrade_event_cache(cache) else { return false; };
+                    let started = Instant::now();
+                    let _ = work.run_batch(&cache).await;
+                    trace!(elapsed_ms = started.elapsed().as_millis(), "Finished redecryption work batch");
+                }
+                else => return false,
             }
         }
     }
 
     async fn listen_for_room_keys_task(
         cache: Weak<EventCacheInner>,
-        decryption_request_stream: UnboundedReceiverStream<DecryptionRetryRequest>,
+        decryption_request_stream: UnboundedReceiverStream<DecryptionRetryCommand>,
         events_stream: BroadcastStream<RoomEventCacheLinkedChunkUpdate>,
         backup_state_stream: impl Stream<Item = Result<BackupState, BroadcastStreamRecvError>>,
     ) {
@@ -1062,11 +1421,13 @@ impl Redecryptor {
         pin_mut!(events_stream);
         pin_mut!(backup_state_stream);
 
+        let mut work = RedecryptionWork::default();
         while Self::redecryption_loop(
             &cache,
             &mut decryption_request_stream,
             &mut events_stream,
             &mut backup_state_stream,
+            &mut work,
         )
         .await
         {
@@ -1074,9 +1435,7 @@ impl Redecryptor {
 
             // Report that the stream got recreated so listeners know about it, at the same
             // time retry to decrypt anything we have cached in memory.
-            if send_report_and_retry_memory_events(&cache, RedecryptorReport::Lagging)
-                .await
-                .is_err()
+            if schedule_memory_events(&cache, &mut work, RedecryptorReport::Lagging).await.is_err()
             {
                 break;
             }
@@ -1093,7 +1452,7 @@ mod tests {
         collections::BTreeSet,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1141,6 +1500,281 @@ mod tests {
         test_utils::mocks::MatrixMockServer,
     };
 
+    #[async_test]
+    async fn test_refresh_progresses_across_rooms_under_continuous_utd_requests() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let cache = client.event_cache();
+        let mut work = super::RedecryptionWork::default();
+        for room in [room_id!("!refresh-a:example.org"), room_id!("!refresh-b:example.org")] {
+            work.refresh_sessions.insert(room.to_owned(), ["refresh-session".into()].into());
+        }
+        let mut iterations = 0;
+        while cache.redecryption_stats_for_testing().refresh_queries < 2 && iterations < 32 {
+            // Keep UTD work continuously ready. Sessions need not have events
+            // to exercise the scheduler's fairness at the store boundary.
+            work.utd_sessions
+                .entry(room_id!("!utd:example.org").to_owned())
+                .or_default()
+                .insert(format!("utd-{iterations}"));
+            work.run_batch(&cache).await.unwrap();
+            iterations += 1;
+        }
+        assert_eq!(cache.redecryption_stats_for_testing().refresh_queries, 2);
+        assert!(
+            !work.utd_sessions.is_empty(),
+            "refresh must progress while UTD work is still pending"
+        );
+    }
+
+    #[async_test]
+    async fn test_failed_session_query_stops_at_retry_limit() {
+        let store = DelayingStore::new();
+        store.delaying.store(false, Ordering::SeqCst);
+        store.failing_queries.store(usize::MAX, Ordering::SeqCst);
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new(CrossProcessLockConfig::SingleProcess)
+                        .event_cache_store(store.clone()),
+                )
+            })
+            .build()
+            .await;
+        let cache = client.event_cache();
+        let mut work = super::RedecryptionWork::default();
+        work.refresh_sessions
+            .insert(room_id!("!failed:example.org").to_owned(), ["session".into()].into());
+        for attempt in 1..=super::MAX_BATCH_ATTEMPTS {
+            assert!(work.run_batch(&cache).await.is_err());
+            assert_eq!(store.query_count.load(Ordering::SeqCst), attempt);
+            if attempt < super::MAX_BATCH_ATTEMPTS {
+                assert!(!work.is_empty());
+                assert_eq!(work.failed_batches.len(), 1);
+                assert_eq!(work.failed_batches[0].attempts, attempt);
+                // Advance just the retry deadline, without timing assertions.
+                work.failed_batches[0].retry_at = ruma::time::Instant::now();
+            }
+        }
+        assert!(work.is_empty(), "a persistent store error must not create a busy loop");
+    }
+
+    #[async_test]
+    async fn test_failed_batches_recover_without_another_external_request() {
+        #[derive(Clone, Copy, Debug)]
+        enum Stage {
+            LoadUtds,
+            LoadRefresh,
+            PersistDecryption,
+            PersistRefresh,
+        }
+
+        let room_id = room_id!("!retry:localhost");
+        let factory = EventFactory::new().room(room_id);
+        let (alice, bob, server, store) = set_up_clients(room_id, false, true).await;
+        let store = store.unwrap();
+        store.delaying.store(false, Ordering::SeqCst);
+        let cache = bob.event_cache();
+        // Exercise the worker's batches directly so the injected failure and
+        // retry deadline are deterministic; use real Megolm and store methods.
+        cache.abort_redecryptor_for_testing().await;
+        let (event, key) = prepare_room(&server, &factory, &alice, &bob, room_id).await;
+        server
+            .mock_sync()
+            .ok_and_run(&bob, |builder| {
+                builder.add_joined_room(
+                    JoinedRoomBuilder::new(room_id).add_timeline_event(event.clone()),
+                );
+            })
+            .await;
+        let (room_cache, _handles) = cache.for_room(room_id).await.unwrap();
+        let event_id = event_id!("$some_id");
+        let utd = room_cache.find_event_strict(event_id).await.unwrap().unwrap();
+        assert_matches!(&utd.kind, TimelineEventKind::UnableToDecrypt { .. });
+        server
+            .mock_sync()
+            .ok_and_run(&bob, |builder| {
+                builder.add_to_device_event(key.deserialize_as().unwrap());
+            })
+            .await;
+        let room = bob.get_room(room_id).unwrap();
+        let decrypted = room.decrypt_event(event.cast_ref_unchecked::<ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent>(), None).await.unwrap();
+        assert_matches!(&decrypted.kind, TimelineEventKind::Decrypted(actual));
+        let expected_info = actual.encryption_info.clone();
+        assert_matches!(&expected_info.verification_state, VerificationState::Unverified(_));
+        let session = expected_info.session_id().unwrap().to_owned();
+
+        for stage in
+            [Stage::LoadUtds, Stage::LoadRefresh, Stage::PersistDecryption, Stage::PersistRefresh]
+        {
+            let mut work = super::RedecryptionWork::default();
+            let refresh = matches!(stage, Stage::LoadRefresh | Stage::PersistRefresh);
+            let mut initial = if refresh { decrypted.clone() } else { utd.clone() };
+            if let TimelineEventKind::Decrypted(event) = &mut initial.kind {
+                Arc::make_mut(&mut event.encryption_info).verification_state =
+                    VerificationState::Verified;
+            }
+            room_cache.replace_event_for_testing(event_id, initial.clone()).await;
+            match stage {
+                Stage::LoadUtds => {
+                    work.utd_sessions.insert(room_id.to_owned(), [session.clone()].into());
+                }
+                Stage::PersistDecryption => {
+                    work.utd_events
+                        .insert(room_id.to_owned(), [(event_id.to_owned(), event.clone())].into());
+                }
+                Stage::LoadRefresh => {
+                    work.refresh_sessions.insert(room_id.to_owned(), [session.clone()].into());
+                }
+                Stage::PersistRefresh => {
+                    let TimelineEventKind::Decrypted(event) = initial.kind else {
+                        panic!("decrypted fixture");
+                    };
+                    work.refresh_events
+                        .insert(room_id.to_owned(), [(event_id.to_owned(), event)].into());
+                }
+            }
+            if matches!(stage, Stage::LoadUtds | Stage::LoadRefresh) {
+                store.failing_queries.store(1, Ordering::SeqCst);
+            } else {
+                store.failing_writes.store(1, Ordering::SeqCst);
+            }
+            assert!(work.run_batch(&cache).await.is_err(), "{stage:?}");
+            assert!(!work.is_empty(), "failed work must remain pending: {stage:?}");
+            assert_eq!(work.failed_batches.len(), 1, "{stage:?}");
+            work.failed_batches[0].retry_at =
+                ruma::time::Instant::now() + Duration::from_secs(3600);
+            assert!(work.take_batch().is_none(), "respect retry backoff: {stage:?}");
+            let another_room = room_id!("!other-retry:localhost");
+            work.utd_sessions.insert(another_room.to_owned(), ["another-session".into()].into());
+            work.run_batch(&cache).await.unwrap();
+            assert!(
+                !work.utd_sessions.contains_key(another_room),
+                "new UTDs must not wait for backoff"
+            );
+            assert_eq!(work.failed_batches.len(), 1);
+            work.failed_batches[0].retry_at = ruma::time::Instant::now();
+            while !work.is_empty() {
+                work.run_batch(&cache).await.unwrap();
+            }
+            let current = room_cache.find_event_strict(event_id).await.unwrap().unwrap();
+            assert_matches!(current.kind, TimelineEventKind::Decrypted(actual));
+            assert_eq!(actual.encryption_info, expected_info, "{stage:?}");
+            let persisted =
+                store.memory_store.find_event(room_id, event_id).await.unwrap().unwrap();
+            assert_eq!(persisted.encryption_info(), Some(&expected_info), "{stage:?}");
+        }
+    }
+
+    #[async_test]
+    async fn test_failed_pinned_write_publishes_its_pending_replacement_on_retry() {
+        use crate::test_utils::mocks::RoomRelationsResponseTemplate;
+
+        let room_id = room_id!("!pinned-retry:localhost");
+        let factory = EventFactory::new().room(room_id);
+        let (alice, bob, server, store) = set_up_clients(room_id, false, true).await;
+        let store = store.unwrap();
+        store.delaying.store(false, Ordering::SeqCst);
+        let cache = bob.event_cache();
+        cache.abort_redecryptor_for_testing().await;
+        let (event, key) = prepare_room(&server, &factory, &alice, &bob, room_id).await;
+        let id = event_id!("$some_id");
+        let pin = Raw::new(&json!({
+            "event_id": "$pin", "sender": bob.user_id().unwrap(), "origin_server_ts": 1000,
+            "type": "m.room.pinned_events", "state_key": "", "content": {"pinned": [id]},
+        }))
+        .unwrap()
+        .cast_unchecked();
+        server
+            .mock_sync()
+            .ok_and_run(&bob, |builder| {
+                builder.add_joined_room(
+                    JoinedRoomBuilder::new(room_id).add_state_event(pin).add_timeline_event(event),
+                );
+            })
+            .await;
+        server.mock_room_relations().ok(RoomRelationsResponseTemplate::default()).mount().await;
+        let (room_cache, _handles) = cache.for_room(room_id).await.unwrap();
+        let (mut pinned_events, mut receiver) =
+            room_cache.subscribe_to_pinned_events().await.unwrap();
+        timeout(
+            async {
+                while pinned_events.is_empty() {
+                    receiver.recv().await.unwrap();
+                    pinned_events = room_cache.subscribe_to_pinned_events().await.unwrap().0;
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_matches!(&pinned_events[0].kind, TimelineEventKind::UnableToDecrypt { .. });
+        server
+            .mock_sync()
+            .ok_and_run(&bob, |builder| {
+                builder.add_to_device_event(key.deserialize_as().unwrap());
+            })
+            .await;
+
+        let mut work = super::RedecryptionWork::default();
+        work.add_loaded_events(room_id, pinned_events);
+        store.failing_pinned_writes.store(1, Ordering::SeqCst);
+        assert!(work.run_batch(&cache).await.is_err());
+        assert_eq!(work.failed_batches.len(), 1);
+        work.failed_batches[0].retry_at = ruma::time::Instant::now();
+        while !work.is_empty() {
+            work.run_batch(&cache).await.unwrap();
+        }
+        let update = timeout(receiver.recv(), Duration::from_secs(5)).await.unwrap().unwrap();
+        assert_matches!(&update.diffs[0], VectorDiff::Set { value, .. });
+        assert_matches!(&value.kind, TimelineEventKind::Decrypted(_));
+        let (events, _) = room_cache.subscribe_to_pinned_events().await.unwrap();
+        assert_matches!(&events[0].kind, TimelineEventKind::Decrypted(_));
+        let chunks =
+            store.memory_store.load_all_chunks(LinkedChunkId::PinnedEvents(room_id)).await.unwrap();
+        let persisted: Vec<_> = chunks
+            .into_iter()
+            .flat_map(|chunk| match chunk.content {
+                matrix_sdk_base::linked_chunk::ChunkContent::Items(items) => items,
+                matrix_sdk_base::linked_chunk::ChunkContent::Gap(_) => Vec::new(),
+            })
+            .collect();
+        assert_matches!(&persisted[0].kind, TimelineEventKind::Decrypted(_));
+    }
+
+    #[async_test]
+    async fn test_worker_retries_store_failures_and_remains_alive_after_the_limit() {
+        let store = DelayingStore::new();
+        store.delaying.store(false, Ordering::SeqCst);
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new(CrossProcessLockConfig::SingleProcess)
+                        .event_cache_store(store.clone()),
+                )
+            })
+            .build()
+            .await;
+        let cache = client.event_cache();
+        cache.subscribe().unwrap();
+        let mut expected_queries = 0;
+        for (failures, attempts) in [(1, 2), (usize::MAX, super::MAX_BATCH_ATTEMPTS), (0, 1)] {
+            store.failing_queries.store(failures, Ordering::SeqCst);
+            cache.request_decryption(DecryptionRetryRequest {
+                room_id: room_id!("!worker-retry:example.org").to_owned(),
+                utd_session_ids: Default::default(),
+                refresh_info_session_ids: ["session".into()].into(),
+            });
+            timeout(cache.redecryptor_barrier_for_testing(), Duration::from_secs(5)).await.unwrap();
+            expected_queries += attempts;
+            assert_eq!(store.query_count.load(Ordering::SeqCst), expected_queries);
+        }
+    }
+
     /// A wrapper for the memory store for the event cache.
     ///
     /// Delays the persisting of events, or linked chunk updates, to allow the
@@ -1150,6 +1784,10 @@ mod tests {
         memory_store: MemoryStore,
         delaying: Arc<AtomicBool>,
         foo: Arc<Mutex<Option<Sender<()>>>>,
+        failing_queries: Arc<AtomicUsize>,
+        failing_writes: Arc<AtomicUsize>,
+        failing_pinned_writes: Arc<AtomicUsize>,
+        query_count: Arc<AtomicUsize>,
     }
 
     impl DelayingStore {
@@ -1158,6 +1796,10 @@ mod tests {
                 memory_store: MemoryStore::new(),
                 delaying: AtomicBool::new(true).into(),
                 foo: Arc::new(Mutex::new(None)),
+                failing_queries: Default::default(),
+                failing_writes: Default::default(),
+                failing_pinned_writes: Default::default(),
+                query_count: Default::default(),
             }
         }
 
@@ -1171,6 +1813,20 @@ mod tests {
             self.delaying.store(false, Ordering::SeqCst);
 
             receiver.await.expect("We should be able to receive a response")
+        }
+
+        fn fail_if_requested(counter: &AtomicUsize) -> Result<(), EventCacheStoreError> {
+            if counter
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .is_ok()
+            {
+                Err(EventCacheStoreError::backend(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "injected transient store failure",
+                )))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1201,6 +1857,10 @@ mod tests {
             linked_chunk_id: LinkedChunkId<'_>,
             updates: Vec<Update<Event, Gap>>,
         ) -> Result<(), Self::Error> {
+            Self::fail_if_requested(&self.failing_writes)?;
+            if matches!(linked_chunk_id, LinkedChunkId::PinnedEvents(_)) {
+                Self::fail_if_requested(&self.failing_pinned_writes)?;
+            }
             // This is the key behaviour of this store - we wait to set this value until
             // someone calls `stop_delaying`.
             //
@@ -1284,6 +1944,8 @@ mod tests {
             event_type: Option<&str>,
             session_id: Option<&str>,
         ) -> Result<Vec<Event>, Self::Error> {
+            self.query_count.fetch_add(1, Ordering::SeqCst);
+            Self::fail_if_requested(&self.failing_queries)?;
             self.memory_store.get_room_events(room_id, event_type, session_id).await
         }
 

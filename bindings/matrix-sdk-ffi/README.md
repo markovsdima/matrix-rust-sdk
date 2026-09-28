@@ -108,6 +108,15 @@ Already decrypted cache entries are returned as stored, without decrypting
 again or rechecking subsequently tightened trust settings. This preserves
 previously decrypted data when local keys are no longer available.
 
+Opening a Timeline and pagination retry only newly loaded cache events.
+Pending work is coalesced per room, and UTD work normally runs ahead of
+bounded encryption-info refresh batches. Explicit `retryDecryption` calls
+use the supplied session IDs without scheduling unrelated refreshes.
+Temporary cache errors retain work for up to three attempts with backoff;
+a later key notification, reload, or explicit retry can schedule more work.
+These changes keep the existing indexed UTD selection contract. They do not
+add reconciliation of divergent memory/store copies or legacy cache repair.
+
 ```swift
 let inspection = try await room.inspectTimelineEvent(eventId: eventId)
 switch inspection.disposition {

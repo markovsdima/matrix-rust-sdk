@@ -56,6 +56,7 @@ mod queue;
 mod reactions;
 mod read_receipts;
 mod redecryption;
+mod redecryption_queue;
 mod replies;
 mod subscribe;
 mod thread;

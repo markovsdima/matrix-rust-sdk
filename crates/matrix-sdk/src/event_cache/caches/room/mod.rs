@@ -291,14 +291,7 @@ impl RoomEventCache {
     /// Searches loaded events before storage, like [`Self::find_event`], but
     /// returns `Ok(None)` only when the lookup succeeds without finding an event.
     pub async fn find_event_strict(&self, event_id: &EventId) -> Result<Option<Event>> {
-        Ok(self
-            .inner
-            .state
-            .read()
-            .await?
-            .find_event(event_id)
-            .await?
-            .map(|(_loc, event)| event))
+        Ok(self.inner.state.read().await?.find_event(event_id).await?.map(|(_loc, event)| event))
     }
 
     /// Number of retained event-focused caches, for integration tests.
@@ -422,6 +415,26 @@ impl RoomEventCache {
             Err(err) => {
                 warn!("couldn't save event in the event cache: {err}");
             }
+        }
+    }
+
+    /// Simulate a newer loaded copy arriving while a test pauses redecryption.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn replace_event_for_testing(&self, event_id: &EventId, event: Event) {
+        let mut state = self.inner.state.write().await.expect("room state");
+        let (location, _) =
+            state.find_event(event_id).await.expect("event lookup").expect("event exists");
+        state.replace_event_at(location, event).await.expect("replace event");
+        let diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
+        if !diffs.is_empty() {
+            self.inner.update_sender.send(
+                RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                    diffs,
+                    origin: EventsOrigin::Cache,
+                }),
+                Some(RoomEventCacheGenericUpdate { room_id: self.inner.room_id.clone() }),
+            );
         }
     }
 

@@ -390,6 +390,11 @@ async fn test_retry_edit_decryption() {
     assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 0, .. });
     assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { .. });
 
+    let mut items: imbl::Vector<_> =
+        timeline.items().await.iter().filter_map(|item| item.as_event().cloned()).collect();
+    assert_eq!(items.len(), 2);
+    let original_event_id = items[0].event_id().unwrap().to_owned();
+
     // When we provide the keys for them a redecryption will trigger.
     let mut keys = decrypt_room_key_export(Cursor::new(SESSION1_KEY), "1234").unwrap();
     keys.extend(decrypt_room_key_export(Cursor::new(SESSION2_KEY), "1234").unwrap());
@@ -404,15 +409,20 @@ async fn test_retry_edit_decryption() {
         .await
         .unwrap();
 
-    // Then first, the first item gets decrypted on its own
-    assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 0, .. });
-
-    // And second, they get resolved into a single event after the edit is decrypted
-    assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 0, value } => value);
-    let item =
-        assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 0, value } => value);
-
-    assert_next_matches_with_timeout!(stream, VectorDiff::Remove { index: 1 });
+    // Keys may be processed in either order. A decrypted edit must be kept
+    // until its original is decryptable, and its UTD placeholder must disappear.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while items.len() != 1
+            || !items[0].content().as_message().is_some_and(|message| message.is_edited())
+        {
+            let update = assert_next_with_timeout!(stream);
+            update.apply(&mut items);
+        }
+    })
+    .await
+    .unwrap();
+    let item = &items[0];
+    assert_eq!(item.event_id(), Some(original_event_id.as_ref()));
 
     assert_matches!(item.encryption_info(), Some(_));
     assert_matches!(item.latest_edit_json(), Some(_));

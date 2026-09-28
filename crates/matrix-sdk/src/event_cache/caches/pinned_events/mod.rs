@@ -255,15 +255,19 @@ impl PinnedEventCache {
     /// list of decrypted events, and replace them, while alerting observers
     /// about the update.
     #[cfg(feature = "e2e-encryption")]
-    pub(in crate::event_cache) async fn replace_utds(&self, events: &[ResolvedUtd]) -> Result<()> {
+    pub(in crate::event_cache) async fn replace_utds(
+        &self,
+        events: &[ResolvedUtd],
+    ) -> Result<BTreeSet<OwnedEventId>> {
         let mut guard = self.state.write().await?;
 
-        if guard.state.chunk.replace_utds(events) {
+        let replaced = guard.state.chunk.replace_utds(events);
+        if !replaced.is_empty() {
             guard.propagate_changes().await?;
             guard.notify_subscribers(EventsOrigin::Cache);
         }
 
-        Ok(())
+        Ok(replaced)
     }
 
     /// Given a raw event, try to extract the target event ID of a relation as

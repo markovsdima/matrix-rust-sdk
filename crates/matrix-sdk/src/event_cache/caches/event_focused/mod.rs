@@ -597,12 +597,17 @@ impl EventFocusedCache {
     /// list of decrypted events, and replace them, while alerting observers
     /// about the update.
     #[cfg(feature = "e2e-encryption")]
-    pub async fn replace_utds(&self, events: &[ResolvedUtd]) {
+    pub async fn replace_utds(
+        &self,
+        events: &[ResolvedUtd],
+    ) -> std::collections::BTreeSet<OwnedEventId> {
         let mut guard = self.inner.write().await;
-        if guard.chunk.replace_utds(events) {
+        let replaced = guard.chunk.replace_utds(events);
+        if !replaced.is_empty() {
             guard.propagate_changes();
             guard.notify_subscribers(EventsOrigin::Cache);
         }
+        replaced
     }
 }
 

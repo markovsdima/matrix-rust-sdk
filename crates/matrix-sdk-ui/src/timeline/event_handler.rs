@@ -617,6 +617,12 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
         let mut added_item = false;
 
+        if matches!(timeline_action, TimelineAction::HandleAggregation { .. })
+            && let Flow::Remote { txn_id: Some(txn_id), .. } = &self.ctx.flow
+        {
+            self.meta.aggregations.acknowledge_remote_echo(txn_id);
+        }
+
         match timeline_action {
             TimelineAction::AddItem { content } => {
                 if self.ctx.should_add_new_items {

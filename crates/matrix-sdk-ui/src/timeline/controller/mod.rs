@@ -15,7 +15,11 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    sync::{Arc, OnceLock},
+    future::Future,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use as_variant::as_variant;
@@ -25,14 +29,10 @@ use futures_core::Stream;
 use imbl::Vector;
 use matrix_sdk::{
     deserialized_responses::TimelineEvent,
-    event_cache::{
-        DecryptionRetryRequest, EventFocusThreadMode, PaginationStatus, RoomEventCache,
-        TimelineVectorDiffs,
-    },
+    event_cache::{DecryptionRetryRequest, EventFocusThreadMode, PaginationStatus, RoomEventCache},
     send_queue::{
         LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendHandle, SendReactionHandle,
     },
-    task_monitor::BackgroundTaskHandle,
 };
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
@@ -52,15 +52,13 @@ use ruma::{
     serde::Raw,
 };
 use tokio::sync::{RwLock, RwLockWriteGuard, broadcast};
-use tracing::{
-    Instrument as _, Span, debug, error, field::debug, info, info_span, instrument, trace, warn,
-};
+use tracing::{debug, error, field::debug, info, instrument, trace, warn};
 
 pub(super) use self::{
     metadata::{RelativePosition, TimelineMetadata},
     observable_items::{
         AllRemoteEvents, ObservableItems, ObservableItemsEntry, ObservableItemsTransaction,
-        ObservableItemsTransactionEntry,
+        ObservableItemsTransactionEntry, TimelineUpdateCounts,
     },
     state::TimelineState,
     state_transaction::TimelineStateTransaction,
@@ -81,9 +79,7 @@ use crate::{
         MsgLikeContent, MsgLikeKind, Room, TimelineEventFilterFn, TimelineEventFocusThreadMode,
         algorithms::rfind_event_by_item_id,
         controller::decryption_retry_task::compute_redecryption_candidates,
-        date_dividers::DateDividerAdjuster,
-        event_item::TimelineItemHandle,
-        tasks::{event_focused_task, pinned_events_task, thread_updates_task},
+        date_dividers::DateDividerAdjuster, event_item::TimelineItemHandle,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -186,8 +182,35 @@ impl TimelineFocusKind {
     }
 }
 
+#[cfg(test)]
+type CacheRebuildHook = Arc<
+    tokio::sync::Mutex<
+        Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    >,
+>;
+
 #[derive(Clone, Debug)]
 pub(super) struct TimelineController<P: RoomDataProvider = Room> {
+    /// Process-local correlation ID. Contains no room or event identifiers.
+    diagnostic_id: u64,
+
+    #[cfg(test)]
+    pub(super) cache_rebuild_hook: CacheRebuildHook,
+
+    #[cfg(test)]
+    pub(super) focused_rebuilds: Arc<AtomicU64>,
+    #[cfg(test)]
+    pub(super) focused_skipped: Arc<AtomicU64>,
+
+    #[cfg(test)]
+    pub(super) focused_task_hook: Arc<
+        tokio::sync::Mutex<
+            Option<
+                tokio::sync::mpsc::UnboundedReceiver<crate::timeline::tasks::FocusedTestCommand>,
+            >,
+        >,
+    >,
+
     /// Inner mutable state.
     state: Arc<RwLock<TimelineState<P>>>,
 
@@ -203,6 +226,8 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room> {
     /// Settings applied to this timeline.
     pub(super) settings: TimelineSettings,
 }
+
+static NEXT_TIMELINE_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(super) struct TimelineSettings {
@@ -335,9 +360,11 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
 pub(super) struct InitFocusResult {
     /// Loaded snapshots to retry without querying their full persisted sessions.
     pub retry_events: Vec<TimelineEvent>,
-    /// If the timeline is a non-live timeline, an extra task that subscribes to
-    /// changes to the focus source.
-    pub focus_task: Option<BackgroundTaskHandle>,
+    /// Both receivers continuing the initialized focused snapshot.
+    pub focused_receivers: Option<(
+        broadcast::Receiver<matrix_sdk::event_cache::TimelineVectorDiffs>,
+        matrix_sdk::event_cache::RoomEventCacheSubscriber,
+    )>,
 }
 
 impl<P: RoomDataProvider> TimelineController<P> {
@@ -380,7 +407,60 @@ impl<P: RoomDataProvider> TimelineController<P> {
             is_room_encrypted,
         )));
 
-        Self { state, focus, room_data_provider, settings }
+        let diagnostic_id = NEXT_TIMELINE_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed);
+        let focus_kind = match &*focus {
+            TimelineFocusKind::Live { .. } => "live",
+            TimelineFocusKind::Event { .. } => "event",
+            TimelineFocusKind::Thread { .. } => "thread",
+            TimelineFocusKind::PinnedEvents => "pinned",
+        };
+        debug!(
+            target: "matrix_sdk_ui::timeline::cache_lag",
+            timeline_id = diagnostic_id,
+            focus = focus_kind,
+            receipts = ?settings.track_read_receipts,
+            "Timeline created"
+        );
+        Self {
+            state,
+            focus,
+            room_data_provider,
+            settings,
+            diagnostic_id,
+            #[cfg(test)]
+            cache_rebuild_hook: Default::default(),
+            #[cfg(test)]
+            focused_task_hook: Default::default(),
+            #[cfg(test)]
+            focused_rebuilds: Default::default(),
+            #[cfg(test)]
+            focused_skipped: Default::default(),
+        }
+    }
+
+    pub(super) fn diagnostic_id(&self) -> u64 {
+        self.diagnostic_id
+    }
+
+    /// Cache insertion notifications can be lost to lag before they schedule
+    /// the loaded-event decryption refresh. Recover only events this timeline
+    /// has not processed yet, including events hidden by its filter.
+    pub(super) async fn newly_loaded_snapshot_events(
+        &self,
+        snapshot: &[TimelineEvent],
+    ) -> Vec<TimelineEvent> {
+        let state = self.state.read().await;
+        let known = state
+            .items
+            .all_remote_events()
+            .iter()
+            .map(|event| &event.event_id)
+            .collect::<BTreeSet<_>>();
+        snapshot
+            .iter()
+            .filter(|event| event.event_id().is_some_and(|event_id| !known.contains(&event_id)))
+            .cloned()
+            .collect()
     }
 
     /// Listens to encryption state changes for the room in
@@ -674,22 +754,144 @@ impl<P: RoomDataProvider> TimelineController<P> {
     ///
     /// This is all done with a single lock guard, since we don't want the state
     /// to be modified between the clear and re-insertion of new events.
-    pub(super) async fn replace_with_initial_remote_events<Events>(
+    pub(super) fn replace_with_initial_remote_events<Events>(
         &self,
         events: Events,
         origin: RemoteEventOrigin,
-    ) where
+    ) -> impl Future<Output = TimelineUpdateCounts>
+    where
+        Events: IntoIterator,
+        <Events as IntoIterator>::Item: Into<TimelineEvent>,
+    {
+        self.replace_with_initial_remote_events_inner(events, origin, false, Vec::new())
+    }
+
+    /// Recover a live room timeline, protecting receipts whose store state may
+    /// be ahead of this cache snapshot until their causal position is known.
+    pub(super) fn replace_remote_events_after_cache_lag<Events>(
+        &self,
+        events: Events,
+        origin: RemoteEventOrigin,
+    ) -> impl Future<Output = TimelineUpdateCounts>
+    where
+        Events: IntoIterator,
+        <Events as IntoIterator>::Item: Into<TimelineEvent>,
+    {
+        self.replace_with_initial_remote_events_inner(events, origin, true, Vec::new())
+    }
+
+    async fn replace_with_initial_remote_events_inner<Events>(
+        &self,
+        events: Events,
+        origin: RemoteEventOrigin,
+        recovering_from_lag: bool,
+        relations: Vec<TimelineEvent>,
+    ) -> TimelineUpdateCounts
+    where
         Events: IntoIterator,
         <Events as IntoIterator>::Item: Into<TimelineEvent>,
     {
         let mut state = self.state.write().await;
-
+        let before = state.items.update_counts();
         let track_read_markers = &self.settings.track_read_receipts;
-        if track_read_markers.is_enabled() {
-            state.populate_initial_user_receipt(&self.room_data_provider, ReceiptType::Read).await;
-            state
-                .populate_initial_user_receipt(&self.room_data_provider, ReceiptType::ReadPrivate)
+
+        if recovering_from_lag {
+            let receipt_before = state.meta.read_receipts.search_counts();
+            let previous_items = state.items.clone_items();
+            // One transaction owns the entire rebuild. This includes final
+            // profiles/receipts/marker and its subscriber-skip adjustment.
+            // Concurrent live changes still wait for the same state lock.
+            // Cache snapshots contain remote events only, for every focus.
+            // Preserve pending local changes before replay, including sent
+            // aggregations that have not yet been acknowledged by sync.
+            let local_aggregations = state.meta.aggregations.pending_local_aggregations();
+            let mut txn = state.transaction();
+            txn.clear();
+            for (target, aggregation) in local_aggregations {
+                txn.meta.aggregations.add(target, aggregation);
+            }
+            txn.meta.start_control_recovery();
+            txn.items.coalesce_rebuild(previous_items);
+            txn.handle_remote_events_with_diffs(
+                vec![VectorDiff::Append { values: events.into_iter().map(Into::into).collect() }],
+                origin,
+                &self.room_data_provider,
+                &self.settings,
+            )
+            .await;
+            if !relations.is_empty() {
+                txn.handle_remote_aggregations(
+                    vec![VectorDiff::Append { values: relations.into() }],
+                    origin,
+                    &self.room_data_provider,
+                    &self.settings,
+                )
                 .await;
+            }
+            if track_read_markers.is_enabled() {
+                txn.populate_initial_user_receipt(
+                    &self.room_data_provider,
+                    ReceiptType::Read,
+                    true,
+                )
+                .await;
+                txn.populate_initial_user_receipt(
+                    &self.room_data_provider,
+                    ReceiptType::ReadPrivate,
+                    true,
+                )
+                .await;
+            }
+            if txn.items.has_local() {
+                let profile = self
+                    .room_data_provider
+                    .profile_from_user_id(self.room_data_provider.own_user_id())
+                    .await;
+                let updated: Vec<_> = txn.items.iter_locals_region().filter_map(|(index, item)| {
+                    let event = item.as_event()?;
+                    let profile = match &profile {
+                        Some(profile) => {
+                            if matches!(event.sender_profile(), TimelineDetails::Ready(old) if old == profile) {
+                                return None;
+                            }
+                            TimelineDetails::Ready(profile.clone())
+                        }
+                        None if event.sender_profile().is_unavailable() => return None,
+                        None => TimelineDetails::Unavailable,
+                    };
+                    Some((index, item.with_kind(event.with_sender_profile(profile))))
+                }).collect();
+                for (index, item) in updated {
+                    txn.items.replace(index, item);
+                }
+            }
+            if track_read_markers.is_enabled() {
+                if let Some(id) = self.room_data_provider.load_fully_read_marker().await {
+                    txn.set_fully_read_event(id);
+                } else if let Some(id) = txn.latest_user_read_receipt_timeline_event_id(
+                    self.room_data_provider.own_user_id(),
+                ) {
+                    txn.set_fully_read_event(id);
+                }
+            }
+            txn.commit();
+            let after = state.items.update_counts();
+            let receipt_after = state.meta.read_receipts.search_counts();
+            info!(
+                target: "matrix_sdk_ui::timeline::cache_lag",
+                timeline_id = self.diagnostic_id(),
+                recovery_generation = state.meta.control_recovery.as_ref().map_or(0, |recovery| recovery.generation),
+                receipt_position_event_visits = receipt_after.position_event_visits.saturating_sub(receipt_before.position_event_visits),
+                receipt_fallback_item_visits = receipt_after.fallback_item_visits.saturating_sub(receipt_before.fallback_item_visits),
+                receipt_compute_event_visits = receipt_after.compute_event_visits.saturating_sub(receipt_before.compute_event_visits),
+                receipt_deferred_item_adds = receipt_after.deferred_item_adds.saturating_sub(receipt_before.deferred_item_adds),
+                receipt_missing_item_targets = receipt_after.missing_item_targets.saturating_sub(receipt_before.missing_item_targets),
+                "Timeline cache rebuild receipt work"
+            );
+            return TimelineUpdateCounts {
+                operations: after.operations.saturating_sub(before.operations),
+                item_occurrences: after.item_occurrences.saturating_sub(before.item_occurrences),
+            };
         }
 
         // Replace the events if either the current event list or the new one aren't
@@ -707,6 +909,46 @@ impl<P: RoomDataProvider> TimelineController<P> {
                     &self.settings,
                 )
                 .await;
+        } else if track_read_markers.is_enabled() {
+            // Even an empty event snapshot may have a persisted own receipt
+            // pointing outside the loaded range.
+            let mut txn = state.transaction();
+            txn.populate_initial_user_receipt(&self.room_data_provider, ReceiptType::Read, false)
+                .await;
+            txn.populate_initial_user_receipt(
+                &self.room_data_provider,
+                ReceiptType::ReadPrivate,
+                false,
+            )
+            .await;
+            txn.commit();
+        }
+
+        // Remote profiles and public receipts are reloaded while rebuilding the
+        // snapshot. Local echoes survive clear(), so refresh their profiles too:
+        // a member update may have been among the dropped channel messages.
+        if state.items.iter().any(|item| item.is_local_echo()) {
+            let profile = self
+                .room_data_provider
+                .profile_from_user_id(self.room_data_provider.own_user_id())
+                .await;
+            state.items.for_each(|mut entry| {
+                let Some(event) = entry.as_event().filter(|event| event.is_local_echo()) else {
+                    return;
+                };
+                let updated_profile = match &profile {
+                    Some(profile) => {
+                        if matches!(event.sender_profile(), TimelineDetails::Ready(old) if old == profile) {
+                            return;
+                        }
+                        TimelineDetails::Ready(profile.clone())
+                    }
+                    None if event.sender_profile().is_unavailable() => return,
+                    None => TimelineDetails::Unavailable,
+                };
+                let updated = entry.with_kind(event.with_sender_profile(updated_profile));
+                ObservableItemsEntry::replace(&mut entry, updated);
+            });
         }
 
         if track_read_markers.is_enabled() {
@@ -722,10 +964,44 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 state.handle_fully_read_marker(latest_receipt_event_id);
             }
         }
+        let after = state.items.update_counts();
+        TimelineUpdateCounts {
+            operations: after.operations.saturating_sub(before.operations),
+            item_occurrences: after.item_occurrences.saturating_sub(before.item_occurrences),
+        }
     }
 
     pub(super) async fn handle_fully_read_marker(&self, fully_read_event_id: OwnedEventId) {
-        self.state.write().await.handle_fully_read_marker(fully_read_event_id);
+        loop {
+            let (revision, recovering) = {
+                let state = self.state.read().await;
+                (state.meta.fully_read_marker_revision, state.meta.control_recovery.is_some())
+            };
+            let event_id = if recovering {
+                // Unlike receipts, this payload has no timestamp or revision.
+                // A matching event ID is not a fence (queued A -> B -> A). Keep
+                // treating markers as invalidations after recovery, as before.
+                self.room_data_provider
+                    .load_fully_read_marker()
+                    .await
+                    .unwrap_or_else(|| fully_read_event_id.clone())
+            } else {
+                fully_read_event_id.clone()
+            };
+            let mut state = self.state.write().await;
+            // Store I/O holds no timeline lock or transaction. A concurrent
+            // rebuild, Clear, or marker application invalidates that read;
+            // retry against the current state instead of applying stale data.
+            if state.meta.fully_read_marker_revision != revision
+                || state.meta.control_recovery.is_some() != recovering
+            {
+                continue;
+            }
+            let mut txn = state.transaction();
+            txn.set_fully_read_event(event_id);
+            txn.commit();
+            return;
+        }
     }
 
     pub(super) async fn handle_ephemeral_events(
@@ -737,7 +1013,33 @@ impl<P: RoomDataProvider> TimelineController<P> {
             return;
         }
         let mut state = self.state.write().await;
-        state.handle_ephemeral_events(events, &self.room_data_provider).await;
+        let Some(batch) = state.handle_ephemeral_events(events, &self.room_data_provider).await
+        else {
+            return;
+        };
+        let Some(recovery) = &state.meta.control_recovery else { return };
+        let recovery_generation = recovery.generation;
+        let total = recovery.receipt_reconciliation;
+        drop(state);
+        // One aggregate per input batch that actually consulted the store,
+        // including EDUs delivered after the rebuild has finished. Emit after
+        // releasing the state lock, using the committed generation's totals.
+        info!(
+            target: "matrix_sdk_ui::timeline::cache_lag",
+            timeline_id = self.diagnostic_id(),
+            recovery_generation,
+            receipt_store_reads = batch.store_reads,
+            receipt_store_matched = batch.matched,
+            receipt_store_differed = batch.differed,
+            receipt_store_missing = batch.missing,
+            receipt_store_read_us = batch.store_read_us,
+            receipt_store_reads_total = total.store_reads,
+            receipt_store_matched_total = total.matched,
+            receipt_store_differed_total = total.differed,
+            receipt_store_missing_total = total.missing,
+            receipt_store_read_us_total = total.store_read_us,
+            "Timeline recovery receipt reconciliation"
+        );
     }
 
     /// Creates the local echo for an event we're sending.
@@ -1333,11 +1635,14 @@ impl TimelineController {
         &self,
         focus: &TimelineFocus,
         room_event_cache: &RoomEventCache,
+        initial_room_events: Vec<TimelineEvent>,
     ) -> Result<InitFocusResult, Error> {
         match focus {
             TimelineFocus::Live { .. } => {
                 // Retrieve the cached events, and add them to the timeline.
-                let events = room_event_cache.events().await?;
+                // These events and the room receiver were acquired together.
+                // Reading events() again would replay already-snapshotted diffs.
+                let events = initial_room_events;
 
                 let retry_events = events.clone();
 
@@ -1354,7 +1659,7 @@ impl TimelineController {
                     PaginationStatus::Paginating => {}
                 }
 
-                Ok(InitFocusResult { retry_events, focus_task: None })
+                Ok(InitFocusResult { retry_events, focused_receivers: None })
             }
 
             TimelineFocus::Event { target: event_id, num_context_events, thread_mode } => {
@@ -1375,10 +1680,6 @@ impl TimelineController {
                     .await
                     .map_err(PaginationError::EventCache)?;
 
-                let (events, receiver) = cache.subscribe().await;
-
-                let retry_events = events.clone();
-
                 // Ask the cache for the thread root, if it managed to extract one or decided
                 // that the target event was the thread root.
                 match &*self.focus {
@@ -1394,127 +1695,85 @@ impl TimelineController {
                     }
                 }
 
-                self.replace_with_initial_remote_events(events, RemoteEventOrigin::Pagination)
-                    .await;
-
-                let task = self
-                    .room_data_provider
-                    .client()
-                    .task_monitor()
-                    .spawn_infinite_task(
-                        "timeline::event_focused_cache_updates",
-                        event_focused_task(
-                            event_id.clone(),
-                            (*thread_mode).into(),
-                            room_event_cache.clone(),
-                            self.clone(),
-                            receiver,
-                        ),
-                    )
-                    .abort_on_drop();
-
-                Ok(InitFocusResult { retry_events, focus_task: Some(task) })
+                // The initial focused and room subscriptions must share the same
+                // boundary too. An old room receiver could replay stale controls.
+                let snapshot = self.focused_snapshot(focus, room_event_cache).await?;
+                self.initialize_focused_snapshot(snapshot, RemoteEventOrigin::Pagination).await
             }
 
-            TimelineFocus::Thread { root_event_id, .. } => {
-                let (retry_events, receiver) =
-                    self.init_with_thread_root(root_event_id, room_event_cache).await?;
-
-                let room = &self.room_data_provider;
-                let span = info_span!(
-                    parent: Span::none(),
-                    "thread_live_update_handler",
-                    room_id = ?room.room_id(),
-                );
-                span.follows_from(Span::current());
-
-                let task = room
-                    .client()
-                    .task_monitor()
-                    .spawn_infinite_task(
-                        "timeline::thread_event_cache_updates",
-                        thread_updates_task(
-                            receiver,
-                            room_event_cache.clone(),
-                            self.clone(),
-                            root_event_id.clone(),
-                        )
-                        .instrument(span),
-                    )
-                    .abort_on_drop();
-
-                Ok(InitFocusResult { retry_events, focus_task: Some(task) })
+            TimelineFocus::Thread { root_event_id } => {
+                let snapshot = room_event_cache
+                    .subscribe_to_thread_with_room_updates(root_event_id.clone())
+                    .await?;
+                self.initialize_focused_snapshot(snapshot, RemoteEventOrigin::Cache).await
             }
 
             TimelineFocus::PinnedEvents => {
-                let (initial_events, pinned_events_recv) =
-                    room_event_cache.subscribe_to_pinned_events().await?;
-
-                let retry_events = initial_events.clone();
-
-                self.replace_with_initial_remote_events(
-                    initial_events,
-                    RemoteEventOrigin::Pagination,
-                )
-                .await;
-
-                let task = self
-                    .room_data_provider
-                    .client()
-                    .task_monitor()
-                    .spawn_infinite_task(
-                        "timeline::pinned_event_cache_updates",
-                        pinned_events_task(
-                            room_event_cache.clone(),
-                            self.clone(),
-                            pinned_events_recv,
-                        ),
-                    )
-                    .abort_on_drop();
-
-                Ok(InitFocusResult { retry_events, focus_task: Some(task) })
+                let snapshot =
+                    room_event_cache.subscribe_to_pinned_events_with_room_updates().await?;
+                self.initialize_focused_snapshot(snapshot, RemoteEventOrigin::Pagination).await
             }
         }
     }
 
-    /// (Re-)initialise a timeline using [`TimelineFocus::Thread`] with cached
-    /// threaded events and secondary relations.
-    ///
-    /// Returns the loaded events and a receiver for subsequent updates.
-    pub(super) async fn init_with_thread_root(
+    async fn initialize_focused_snapshot(
         &self,
-        root_event_id: &OwnedEventId,
-        room_event_cache: &RoomEventCache,
-    ) -> Result<(Vec<TimelineEvent>, broadcast::Receiver<TimelineVectorDiffs>), Error> {
-        let (events, receiver) =
-            room_event_cache.subscribe_to_thread(root_event_id.clone()).await?;
+        snapshot: matrix_sdk::event_cache::FocusedTimelineSnapshot,
+        origin: RemoteEventOrigin,
+    ) -> Result<InitFocusResult, Error> {
+        let matrix_sdk::event_cache::FocusedTimelineSnapshot {
+            events,
+            relations,
+            updates,
+            room_updates,
+        } = snapshot;
         let mut retry_events = events.clone();
-
-        // For each event, we also need to find the related events, as they don't
-        // include the thread relationship, they won't be included in
-        // the initial list of events.
-        let mut related_events = Vector::new();
-        for event_id in events.iter().filter_map(|event| event.event_id()) {
-            if let Some((_original, related)) =
-                room_event_cache.find_event_with_relations(&event_id, None).await?
-            {
-                related_events.extend(related);
-            }
-        }
-
-        self.replace_with_initial_remote_events(events, RemoteEventOrigin::Cache).await;
-
-        // Now that we've inserted the thread events, add the aggregations too.
-        if !related_events.is_empty() {
-            retry_events.extend(related_events.iter().cloned());
+        retry_events.extend(relations.iter().cloned());
+        self.replace_with_initial_remote_events(events, origin).await;
+        if !relations.is_empty() {
             self.handle_remote_aggregations(
-                vec![VectorDiff::Append { values: related_events }],
+                vec![VectorDiff::Append { values: relations.into() }],
                 RemoteEventOrigin::Cache,
             )
             .await;
         }
+        Ok(InitFocusResult { retry_events, focused_receivers: Some((updates, room_updates)) })
+    }
 
-        Ok((retry_events, receiver))
+    pub(super) async fn focused_snapshot(
+        &self,
+        focus: &TimelineFocus,
+        cache: &RoomEventCache,
+    ) -> Result<matrix_sdk::event_cache::FocusedTimelineSnapshot, Error> {
+        Ok(match focus {
+            TimelineFocus::Event { target, thread_mode, .. } => cache
+                .subscribe_to_event_with_room_updates(target.clone(), (*thread_mode).into())
+                .await?
+                .ok_or_else(|| {
+                    Error::EventNotInTimeline(TimelineEventItemId::EventId(target.clone()))
+                })?,
+            TimelineFocus::Thread { root_event_id } => {
+                cache.subscribe_to_thread_with_room_updates(root_event_id.clone()).await?
+            }
+            TimelineFocus::PinnedEvents => {
+                cache.subscribe_to_pinned_events_with_room_updates().await?
+            }
+            TimelineFocus::Live { .. } => unreachable!("live timelines use the room subscriber"),
+        })
+    }
+
+    pub(super) async fn rebuild_focused_snapshot(
+        &self,
+        events: Vec<TimelineEvent>,
+        relations: Vec<TimelineEvent>,
+    ) -> TimelineUpdateCounts {
+        self.replace_with_initial_remote_events_inner(
+            events,
+            RemoteEventOrigin::Cache,
+            true,
+            relations,
+        )
+        .await
     }
 
     /// Given an event identifier, will fetch the details for the event it's
@@ -1855,3 +2114,9 @@ async fn fetch_replied_to_event<P: RoomDataProvider>(
 
     Ok(res)
 }
+
+#[cfg(test)]
+mod cache_lag_repro;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod focused_recovery_tests;

@@ -24,7 +24,6 @@ use std::{
 };
 
 use eyeball::{SharedObservable, Subscriber};
-use eyeball_im::VectorDiff;
 use futures_core::{Stream, ready};
 use matrix_sdk_base::{
     event_cache::{Event, Gap},
@@ -250,6 +249,20 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         // However, we want to get updates as `VectorDiff`s.
         let timeline_event_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
 
+        // The snapshot/subscription boundary is guarded by this same state lock.
+        // Do not defer publication to the pagination caller: a new subscriber
+        // could otherwise receive both these events in its snapshot and their
+        // insertion diffs afterwards.
+        if !timeline_event_diffs.is_empty() {
+            self.update_sender.send(
+                RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                    diffs: timeline_event_diffs,
+                    origin: EventsOrigin::Cache,
+                }),
+                Some(RoomEventCacheGenericUpdate { room_id: self.room_id.clone() }),
+            );
+        }
+
         Ok(match chunk_content {
             ChunkContent::Gap(gap) => {
                 trace!("reloaded chunk from disk (gap)");
@@ -263,11 +276,7 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
             ChunkContent::Items(events) => {
                 trace!(?reached_start, "reloaded chunk from disk ({} items)", events.len());
 
-                LoadMoreEventsBackwardsOutcome::Events {
-                    events,
-                    timeline_event_diffs,
-                    reached_start,
-                }
+                LoadMoreEventsBackwardsOutcome::Events { events, reached_start }
             }
         })
     }
@@ -301,30 +310,6 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
             .map_err(|err| EventCacheError::PaginationError(Arc::new(err)))?;
 
         Ok(Some((response.chunk, response.end)))
-    }
-
-    async fn conclude_backwards_pagination_from_disk(
-        &self,
-        events: Vec<Event>,
-        timeline_event_diffs: Vec<VectorDiff<Event>>,
-        reached_start: bool,
-    ) -> BackPaginationOutcome {
-        if !timeline_event_diffs.is_empty() {
-            self.update_sender.send(
-                RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
-                    diffs: timeline_event_diffs,
-                    origin: EventsOrigin::Cache,
-                }),
-                Some(RoomEventCacheGenericUpdate { room_id: self.room_id.clone() }),
-            );
-        }
-
-        BackPaginationOutcome {
-            reached_start,
-            // This is a backwards pagination. `BackPaginationOutcome` expects events to
-            // be in “reverse order”.
-            events: events.into_iter().rev().collect(),
-        }
     }
 
     async fn conclude_backwards_pagination_from_network(

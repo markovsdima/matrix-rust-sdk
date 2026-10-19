@@ -153,6 +153,11 @@ pub struct RoomEventCacheState {
 }
 
 impl RoomEventCacheState {
+    /// Return the subscriber count.
+    pub fn subscriber_count(&self) -> &Arc<AtomicUsize> {
+        &self.subscriber_count
+    }
+
     /// Return a read-only reference to the underlying room linked chunk.
     pub fn room_linked_chunk(&self) -> &EventLinkedChunk {
         &self.room_linked_chunk
@@ -434,11 +439,6 @@ impl<'a> RoomEventCacheStateLockReadGuard<'a> {
         self.state.event_focused_caches.len()
     }
 
-    /// Return the subscriber count.
-    pub fn subscriber_count(&self) -> &Arc<AtomicUsize> {
-        &self.state.subscriber_count
-    }
-
     /// Find a single event in this room.
     ///
     /// It starts by looking into loaded events in `EventLinkedChunk` before
@@ -549,6 +549,22 @@ impl<'a> RoomEventCacheStateLockReadGuard<'a> {
 }
 
 impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
+    /// Subscribe while retaining the room mutation lock for a focused recovery.
+    pub async fn subscribe_to_pinned_events(
+        &self,
+        room: Room,
+    ) -> Result<(Vec<Event>, Receiver<TimelineVectorDiffs>), EventCacheError> {
+        let pinned_event_cache = self.state.pinned_event_cache.get_or_init(|| {
+            PinnedEventCache::new(
+                room,
+                self.state.linked_chunk_update_sender.clone(),
+                self.state.store.clone(),
+            )
+        });
+
+        pinned_event_cache.subscribe().await
+    }
+
     /// Return a mutable reference to the underlying room linked chunk.
     pub fn room_linked_chunk_mut(&mut self) -> &mut EventLinkedChunk {
         &mut self.state.room_linked_chunk

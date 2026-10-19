@@ -23,8 +23,11 @@ use ruma::{
     EventId, OwnedEventId, OwnedUserId,
     events::{
         AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-        BundledMessageLikeRelations, poll::unstable_start::UnstablePollStartEventContent,
-        relation::Replacement, room::message::RelationWithoutReplacement,
+        BundledMessageLikeRelations,
+        poll::unstable_start::UnstablePollStartEventContent,
+        receipt::{ReceiptThread, ReceiptType},
+        relation::Replacement,
+        room::message::RelationWithoutReplacement,
     },
     room_version_rules::RoomVersionRules,
     serde::Raw,
@@ -55,6 +58,41 @@ pub(crate) struct RemoteEventContext<'a> {
     pub raw_event: &'a Raw<AnySyncTimelineEvent>,
     pub relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
     pub bundled_edit_encryption_info: Option<Arc<EncryptionInfo>>,
+}
+
+/// Recovery is acknowledged independently for each control key. A room snapshot
+/// and the base store have different boundaries: neither an arbitrary sync batch
+/// nor an empty pending-target map proves that all keys have caught up.
+/// Persistent storage makes cloning transaction metadata cheap.
+#[derive(Clone, Debug, Default)]
+pub(in crate::timeline) struct ControlRecovery {
+    pub acknowledged_receipts: imbl::HashSet<(OwnedUserId, ReceiptType, ReceiptThread)>,
+    /// Diagnostic correlation only; never used as a correctness boundary.
+    pub generation: u64,
+    /// Fixed-size totals for reconciliation after this rebuild. Initial receipt
+    /// loading during the rebuild is deliberately outside these counters.
+    pub receipt_reconciliation: ReceiptReconciliationCounts,
+}
+
+/// Aggregate work on unacknowledged receipt keys, with no retained payloads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::timeline) struct ReceiptReconciliationCounts {
+    pub store_reads: u64,
+    pub matched: u64,
+    pub differed: u64,
+    pub missing: u64,
+    /// Sum of store-await durations, not the duration of the whole input batch.
+    pub store_read_us: u64,
+}
+
+impl ReceiptReconciliationCounts {
+    pub fn add(&mut self, batch: Self) {
+        self.store_reads = self.store_reads.saturating_add(batch.store_reads);
+        self.matched = self.matched.saturating_add(batch.matched);
+        self.differed = self.differed.saturating_add(batch.differed);
+        self.missing = self.missing.saturating_add(batch.missing);
+        self.store_read_us = self.store_read_us.saturating_add(batch.store_read_us);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +128,12 @@ pub(in crate::timeline) struct TimelineMetadata {
     pub(crate) own_user_id: OwnedUserId,
 
     // **** DYNAMIC FIELDS ****
+    /// Installed on cache lag and retained until the next rebuild, which
+    /// resets the acknowledgements. An ordinary Clear preserves them. Receipt
+    /// keys stop consulting the store independently once acknowledged; fully
+    /// read markers keep using store refreshes because their IDs are not a
+    /// revision boundary.
+    pub(super) control_recovery: Option<ControlRecovery>,
     /// The next internal identifier for timeline items, used for both local and
     /// remote echoes.
     ///
@@ -113,6 +157,11 @@ pub(in crate::timeline) struct TimelineMetadata {
     /// the read marker.
     pub fully_read_event: Option<OwnedEventId>,
 
+    /// Local invalidation counter for marker reads made outside the state lock.
+    /// Advance on every marker application (even the same ID) and clear; never
+    /// reset across rebuilds. This is not a revision of the base store.
+    pub(super) fully_read_marker_revision: u64,
+
     /// Whether we have a fully read-marker item in the timeline, that's up to
     /// date with the room's read marker.
     ///
@@ -128,6 +177,16 @@ pub(in crate::timeline) struct TimelineMetadata {
 }
 
 impl TimelineMetadata {
+    pub(super) fn start_control_recovery(&mut self) {
+        // Clear preserves the previous recovery, so ordinary Clear cannot reuse
+        // an epoch. Saturation is only a theoretical diagnostic limitation.
+        let generation = self
+            .control_recovery
+            .as_ref()
+            .map_or(1, |previous| previous.generation.saturating_add(1));
+        self.control_recovery = Some(ControlRecovery { generation, ..Default::default() });
+    }
+
     pub(in crate::timeline) fn new(
         own_user_id: OwnedUserId,
         room_version_rules: RoomVersionRules,
@@ -142,10 +201,12 @@ impl TimelineMetadata {
             aggregations: Default::default(),
             replies: Default::default(),
             fully_read_event: Default::default(),
+            fully_read_marker_revision: 0,
             // It doesn't make sense to set this to false until we fill the `fully_read_event`
             // field, otherwise we'll keep on exiting early in `Self::update_read_marker`.
             has_up_to_date_read_marker_item: true,
             read_receipts: Default::default(),
+            control_recovery: None,
             room_version_rules,
             unable_to_decrypt_hook,
             internal_id_prefix,
@@ -159,10 +220,14 @@ impl TimelineMetadata {
         self.aggregations.clear();
         self.replies.clear();
         self.fully_read_event = None;
+        self.fully_read_marker_revision = self.fully_read_marker_revision.wrapping_add(1);
         // We forgot about the fully read marker right above, so wait for a new one
         // before attempting to update it for each new timeline item.
         self.has_up_to_date_read_marker_item = true;
         self.read_receipts.clear();
+        // A vector Clear does not replace the cache receiver or establish a new
+        // control-update boundary. Keep this generation's acknowledgements;
+        // an actual lag rebuild explicitly starts a new ControlRecovery.
     }
 
     /// Get the relative positions of two events in the timeline.

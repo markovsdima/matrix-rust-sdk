@@ -826,6 +826,12 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         ) = match raw.deserialize() {
             // Classical path: the event is valid, can be deserialized, everything is alright.
             Ok(event) => {
+                if event.is_redacted() {
+                    self.items.record_rebuild_redaction(
+                        event.event_id(),
+                        &self.meta.room_version_rules.redaction,
+                    );
+                }
                 let (in_reply_to, thread_root) = self.meta.process_event_relations(
                     &event,
                     &raw,
@@ -1009,6 +1015,11 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 }
             });
 
+            // Removing visible items only unlinks their metadata. Rebuild must
+            // also discard the old remote-event order (including filtered-out
+            // events), while retaining local echoes and their stable IDs.
+            self.items.clear_remote_events();
+
             // Remove stray date dividers
             let mut idx = 0;
             while idx < self.items.len() {
@@ -1032,6 +1043,9 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
 
     #[instrument(skip_all)]
     pub(super) fn set_fully_read_event(&mut self, fully_read_event_id: OwnedEventId) {
+        // Even a repeated ID invalidates older in-flight store reads. Event ID
+        // equality cannot distinguish an A -> B -> A sequence.
+        self.meta.fully_read_marker_revision = self.meta.fully_read_marker_revision.wrapping_add(1);
         // A similar event has been handled already. We can ignore it.
         if self.meta.fully_read_event.as_ref().is_some_and(|id| *id == fully_read_event_id) {
             return;
@@ -1041,7 +1055,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         self.meta.update_read_marker(&mut self.items);
     }
 
-    pub(super) fn commit(self) {
+    pub(super) fn commit(mut self) {
         // Update the `subscriber_skip_count` value.
         let previous_number_of_items = self.number_of_items_when_transaction_started;
         let next_number_of_items = self.items.len();
@@ -1055,6 +1069,8 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 .subscriber_skip_count
                 .update(count, matches!(self.focus, TimelineFocusKind::Live { .. }));
         }
+
+        self.items.finish_rebuild(self.meta.subscriber_skip_count.get());
 
         // Replace the pointer to the previous meta with the new one.
         *self.previous_meta = self.meta;

@@ -17,7 +17,10 @@
 use std::{
     collections::HashMap,
     ops::Sub,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -46,7 +49,7 @@ use ruma::{
     room_version_rules::RoomVersionRules,
     serde::Raw,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::{
     EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
@@ -237,6 +240,8 @@ impl TestTimeline {
 type ReadReceiptMap =
     HashMap<ReceiptType, HashMap<ReceiptThread, HashMap<OwnedUserId, (OwnedEventId, Receipt)>>>;
 
+type MarkerLoadGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
 #[derive(Clone, Debug, Default)]
 struct TestRoomDataProvider {
     /// The ID of our own user.
@@ -246,6 +251,12 @@ struct TestRoomDataProvider {
     ///
     /// Configurable at construction, static for the lifetime of the provider.
     initial_user_receipts: ReadReceiptMap,
+
+    receipt_overrides: Arc<RwLock<ReadReceiptMap>>,
+    receipt_loads: Arc<AtomicUsize>,
+    marker_loads: Arc<AtomicUsize>,
+    marker_override: Arc<RwLock<Option<OwnedEventId>>>,
+    marker_load_gate: Arc<Mutex<Option<MarkerLoadGate>>>,
 
     /// Event id of the event pointed to by the fully read marker.
     ///
@@ -334,6 +345,17 @@ impl RoomDataProvider for TestRoomDataProvider {
         thread: ReceiptThread,
         user_id: &'a UserId,
     ) -> Option<(OwnedEventId, Receipt)> {
+        self.receipt_loads.fetch_add(1, Ordering::Relaxed);
+        if let Some(value) = self
+            .receipt_overrides
+            .read()
+            .await
+            .get(&receipt_type)
+            .and_then(|threads| threads.get(&thread))
+            .and_then(|users| users.get(user_id))
+        {
+            return Some(value.clone());
+        }
         self.initial_user_receipts
             .get(&receipt_type)
             .and_then(|thread_map| thread_map.get(&thread))
@@ -360,7 +382,14 @@ impl RoomDataProvider for TestRoomDataProvider {
     }
 
     async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
-        self.fully_read_marker.clone()
+        self.marker_loads.fetch_add(1, Ordering::Relaxed);
+        let marker = self.marker_override.read().await.clone().or(self.fully_read_marker.clone());
+        let gate = self.marker_load_gate.lock().await.take();
+        if let Some((started, resume)) = gate {
+            let _ = started.send(());
+            let _ = resume.await;
+        }
+        marker
     }
 
     async fn send(&self, content: AnyMessageLikeEventContent) -> Result<(), super::Error> {

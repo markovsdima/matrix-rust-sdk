@@ -120,6 +120,11 @@ impl RoomEventCacheUpdateSender {
 
     /// Send a [`RoomEventCacheUpdate`] and an optional
     /// [`RoomEventCacheGenericUpdate`].
+    ///
+    /// Timeline mutations and publication of their diffs must hold the room
+    /// state write lock continuously. Otherwise a subscriber could observe the
+    /// mutation in its initial snapshot and receive its diffs a second time.
+    /// Do not keep drained timeline diffs across an await point or lock release.
     pub fn send(
         &self,
         room_update: RoomEventCacheUpdate,

@@ -15,7 +15,6 @@
 use std::sync::Arc;
 
 use eyeball::SharedObservable;
-use eyeball_im::VectorDiff;
 use matrix_sdk_base::{
     event_cache::{Event, Gap},
     linked_chunk::ChunkContent,
@@ -163,15 +162,6 @@ impl PaginatedCache for ThreadEventCacheWrapper {
             .map_err(|err| EventCacheError::PaginationError(Arc::new(err)))?;
 
         Ok(Some((response.chunk, response.next_batch_token)))
-    }
-
-    async fn conclude_backwards_pagination_from_disk(
-        &self,
-        _events: Vec<Event>,
-        _timeline_event_diffs: Vec<VectorDiff<Event>>,
-        _reached_start: bool,
-    ) -> BackPaginationOutcome {
-        unimplemented!("loading from disk for threads is not implemented yet");
     }
 
     async fn conclude_backwards_pagination_from_network(

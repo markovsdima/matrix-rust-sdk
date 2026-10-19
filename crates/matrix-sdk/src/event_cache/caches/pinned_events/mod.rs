@@ -243,7 +243,8 @@ impl PinnedEventCache {
 
     /// Subscribe to live events from this room's pinned events cache.
     pub async fn subscribe(&self) -> Result<(Vec<Event>, Receiver<TimelineVectorDiffs>)> {
-        let guard = self.state.read().await?;
+        let mut guard = self.state.write().await?;
+        guard.notify_subscribers(EventsOrigin::Cache);
         let events = guard.state.chunk.events().map(|(_position, item)| item.clone()).collect();
 
         let recv = guard.state.sender.subscribe();

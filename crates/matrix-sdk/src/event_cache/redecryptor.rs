@@ -410,7 +410,11 @@ impl RedecryptionWork {
 
     async fn wait_for_work(&self) {
         if self.has_ready_work() {
+            #[cfg(not(target_family = "wasm"))]
             tokio::task::yield_now().await;
+            // The browser executor does not enable Tokio's `rt` feature.
+            #[cfg(target_family = "wasm")]
+            sleep(Duration::ZERO).await;
         } else if let Some(retry_at) = self.failed_batches.iter().map(|batch| batch.retry_at).min()
         {
             sleep(retry_at.saturating_duration_since(Instant::now())).await;
@@ -1392,8 +1396,10 @@ impl Redecryptor {
                         Err(_) => Some(RedecryptorReport::Lagging),
                         _ => None,
                     };
-                    if let Some(report) = report {
-                        if schedule_memory_events(cache, work, report).await.is_err() { return false; }
+                    if let Some(report) = report
+                        && schedule_memory_events(cache, work, report).await.is_err()
+                    {
+                        return false;
                     }
                 }
                 _ = work.wait_for_work(), if !work.is_empty() => {

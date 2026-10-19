@@ -14,7 +14,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{VecDeque, vec_deque::Iter},
+    collections::{HashMap, VecDeque, vec_deque::Iter},
     iter::{Enumerate, Skip, Take},
     ops::{Deref, RangeBounds},
     sync::Arc,
@@ -26,9 +26,31 @@ use eyeball_im::{
     ObservableVectorTransactionEntry, VectorSubscriber,
 };
 use imbl::Vector;
-use ruma::EventId;
+use indexmap::IndexMap;
+use ruma::{EventId, OwnedEventId, room_version_rules::RedactionRules};
 
 use super::{TimelineItem, metadata::EventMeta};
+
+/// Cumulative operations committed by the timeline producer, before subscriber
+/// adapters and FFI batching. These are occurrences, not unique items or bytes.
+/// Counting never subscribes to the vector or retains timeline items.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::timeline) struct TimelineUpdateCounts {
+    pub operations: u64,
+    pub item_occurrences: u64,
+}
+
+impl TimelineUpdateCounts {
+    fn record(&mut self, item_occurrences: u64) {
+        self.operations = self.operations.saturating_add(1);
+        self.item_occurrences = self.item_occurrences.saturating_add(item_occurrences);
+    }
+
+    fn add(&mut self, other: Self) {
+        self.operations = self.operations.saturating_add(other.operations);
+        self.item_occurrences = self.item_occurrences.saturating_add(other.item_occurrences);
+    }
+}
 
 /// An `ObservableItems` is a type similar to
 /// [`ObservableVector<Arc<TimelineItem>>`] except the API is limited and,
@@ -85,6 +107,10 @@ pub struct ObservableItems {
     /// for more info about that, take a look at the documentation for
     /// [`EventMeta::timeline_item_index`].
     all_remote_events: AllRemoteEvents,
+
+    /// Constant-space diagnostics of committed producer diffs. This also counts
+    /// mutations when there are no subscribers, not actual callback deliveries.
+    update_counts: TimelineUpdateCounts,
 }
 
 impl ObservableItems {
@@ -96,7 +122,12 @@ impl ObservableItems {
             // small enough.
             items: ObservableVector::with_capacity(32),
             all_remote_events: AllRemoteEvents::default(),
+            update_counts: TimelineUpdateCounts::default(),
         }
+    }
+
+    pub(super) fn update_counts(&self) -> TimelineUpdateCounts {
+        self.update_counts
     }
 
     /// Get a reference to all remote events.
@@ -126,6 +157,9 @@ impl ObservableItems {
         ObservableItemsTransaction {
             items: self.items.transaction(),
             all_remote_events: &mut self.all_remote_events,
+            committed_update_counts: &mut self.update_counts,
+            pending_update_counts: TimelineUpdateCounts::default(),
+            rebuild_effects: None,
         }
     }
 
@@ -140,12 +174,17 @@ impl ObservableItems {
         timeline_item_index: usize,
         timeline_item: Arc<TimelineItem>,
     ) -> Arc<TimelineItem> {
-        self.items.set(timeline_item_index, timeline_item)
+        let previous = self.items.set(timeline_item_index, timeline_item);
+        self.update_counts.record(1);
+        previous
     }
 
     /// Get an iterator over all the entries in this `ObservableItems`.
     pub fn entries(&mut self) -> ObservableItemsEntries<'_> {
-        ObservableItemsEntries(self.items.entries())
+        ObservableItemsEntries {
+            entries: self.items.entries(),
+            update_counts: &mut self.update_counts,
+        }
     }
 
     /// Call the given closure for every element in this `ObservableItems`,
@@ -154,7 +193,9 @@ impl ObservableItems {
     where
         F: FnMut(ObservableItemsEntry<'_>),
     {
-        self.items.for_each(|entry| f(ObservableItemsEntry(entry)))
+        self.items.for_each(|entry| {
+            f(ObservableItemsEntry { entry, update_counts: &mut self.update_counts })
+        })
     }
 }
 
@@ -177,24 +218,34 @@ impl Deref for ObservableItems {
 /// returned `Iterator::Item` could live longer than the `Iterator` itself.
 /// Ideally, `Iterator::next` should take a `&'a mut self`, but this is not
 /// possible.
-pub struct ObservableItemsEntries<'a>(ObservableVectorEntries<'a, Arc<TimelineItem>>);
+pub struct ObservableItemsEntries<'a> {
+    entries: ObservableVectorEntries<'a, Arc<TimelineItem>>,
+    update_counts: &'a mut TimelineUpdateCounts,
+}
 
 impl ObservableItemsEntries<'_> {
     /// Advance this iterator, yielding an `ObservableItemsEntry` for the next
     /// item in the timeline, or `None` if all items have been visited.
     pub fn next(&mut self) -> Option<ObservableItemsEntry<'_>> {
-        self.0.next().map(ObservableItemsEntry)
+        self.entries
+            .next()
+            .map(|entry| ObservableItemsEntry { entry, update_counts: self.update_counts })
     }
 }
 
 /// A handle to a single timeline item in an `ObservableItems`.
 #[derive(Debug)]
-pub struct ObservableItemsEntry<'a>(ObservableVectorEntry<'a, Arc<TimelineItem>>);
+pub struct ObservableItemsEntry<'a> {
+    entry: ObservableVectorEntry<'a, Arc<TimelineItem>>,
+    update_counts: &'a mut TimelineUpdateCounts,
+}
 
 impl ObservableItemsEntry<'_> {
     /// Replace the timeline item by `timeline_item`.
     pub fn replace(this: &mut Self, timeline_item: Arc<TimelineItem>) -> Arc<TimelineItem> {
-        ObservableVectorEntry::set(&mut this.0, timeline_item)
+        let previous = ObservableVectorEntry::set(&mut this.entry, timeline_item);
+        this.update_counts.record(1);
+        previous
     }
 }
 
@@ -207,7 +258,7 @@ impl Deref for ObservableItemsEntry<'_> {
     type Target = Arc<TimelineItem>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.entry
     }
 }
 
@@ -221,9 +272,185 @@ impl Deref for ObservableItemsEntry<'_> {
 pub struct ObservableItemsTransaction<'observable_items> {
     items: ObservableVectorTransaction<'observable_items, Arc<TimelineItem>>,
     all_remote_events: &'observable_items mut AllRemoteEvents,
+    committed_update_counts: &'observable_items mut TimelineUpdateCounts,
+    pending_update_counts: TimelineUpdateCounts,
+    /// Only enabled for one cache-lag rebuild. Keep the last semantic replacement
+    /// per event; receipt movements are folded into the final item instead.
+    rebuild_effects: Option<RebuildEffects>,
+}
+
+/// Functional rebuild state: previous rows are needed for terminal projection
+/// transitions. This is scoped to the transaction, never retained by diagnostics.
+#[derive(Debug)]
+struct RebuildEffects {
+    previous_items: HashMap<OwnedEventId, Arc<TimelineItem>>,
+    replacements: IndexMap<OwnedEventId, (Arc<TimelineItem>, Arc<TimelineItem>)>,
 }
 
 impl<'observable_items> ObservableItemsTransaction<'observable_items> {
+    /// Start compacting this rebuild after its initial clear. Ordinary live
+    /// transactions never enable this mode.
+    pub(super) fn coalesce_rebuild(&mut self, previous_items: Vector<Arc<TimelineItem>>) {
+        self.rebuild_effects = Some(RebuildEffects {
+            previous_items: previous_items
+                .iter()
+                .filter_map(|item| {
+                    item.as_event()
+                        .and_then(|event| event.event_id())
+                        .map(|id| (id.to_owned(), item.clone()))
+                })
+                .collect(),
+            replacements: IndexMap::new(),
+        });
+    }
+
+    fn record_rebuild_effect(
+        &mut self,
+        previous: &Arc<TimelineItem>,
+        terminal: &Arc<TimelineItem>,
+    ) {
+        if let Some(effects) = &mut self.rebuild_effects
+            && let Some(event) = terminal.as_event()
+            && let Some(old) = previous.as_event()
+            && let Some(event_id) = event.event_id()
+            && (event.content().is_redacted() != old.content().is_redacted()
+                || event.latest_edit_json().map(|raw| raw.json().get())
+                    != old.latest_edit_json().map(|raw| raw.json().get()))
+        {
+            // Final Append already carries reactions, reply details, profiles
+            // and thread summaries. Preserve only edit/redaction transitions
+            // needed by durable projections, including IDs first loaded here:
+            // absence from this timeline does not mean absence from a catalogue.
+            effects
+                .replacements
+                .entry(event_id.to_owned())
+                .and_modify(|(_, last)| *last = terminal.clone())
+                .or_insert_with(|| (previous.clone(), terminal.clone()));
+        }
+    }
+
+    /// Reuse the normal event parser to recognize a raw redacted snapshot item
+    /// before the timeline filter can discard it. No second snapshot parse.
+    pub(super) fn record_rebuild_redaction(&mut self, event_id: &EventId, rules: &RedactionRules) {
+        let Some(effects) = &mut self.rebuild_effects else { return };
+        let Some(previous) = effects.previous_items.get(event_id) else { return };
+        let Some(event) = previous.as_event().filter(|event| !event.content().is_redacted()) else {
+            return;
+        };
+        let terminal = previous.with_kind(event.redact(rules, false));
+        effects.replacements.insert(event_id.to_owned(), (previous.clone(), terminal));
+    }
+
+    /// Receipt-only replacements need no intermediate delivery: the completed
+    /// rebuild includes their final values. Live transactions keep the same Set.
+    pub(super) fn replace_read_receipts(
+        &mut self,
+        index: usize,
+        item: Arc<TimelineItem>,
+    ) -> Arc<TimelineItem> {
+        let previous = self.items.set(index, item);
+        self.pending_update_counts.record(1);
+        previous
+    }
+
+    /// Replace this transaction's outgoing mutations by its completed state.
+    /// Semantic Sets are retained once per event because consumers can use them
+    /// to invalidate durable projections (e.g. an image edited into text).
+    /// Effects outside the visible suffix use a temporary tail slot: the Set is
+    /// positional, survives subscriber skip, and the final vector is unchanged.
+    pub(super) fn finish_rebuild(&mut self, subscriber_skip: usize) {
+        let Some(mut rebuild) = self.rebuild_effects.take() else { return };
+        let final_items = self.items.deref().clone();
+        // Bundled edits can construct their final content before another
+        // aggregation issues the first Set. Prefer the actual pre-rebuild row.
+        for item in &final_items {
+            let Some(event) = item.as_event() else { continue };
+            let Some(id) = event.event_id() else { continue };
+            let Some(previous) = rebuild.previous_items.get(id) else { continue };
+            let old = previous.as_event().expect("previous event item");
+            if event.content().is_redacted() != old.content().is_redacted()
+                || event.latest_edit_json().map(|raw| raw.json().get())
+                    != old.latest_edit_json().map(|raw| raw.json().get())
+            {
+                rebuild.replacements.insert(id.to_owned(), (previous.clone(), item.clone()));
+            } else {
+                // Replaying an original followed by its separate edit/redaction
+                // can record a transition already delivered before this lag.
+                // Do not publish that obsolete original again. Unknown or
+                // disappeared items still need their captured catalogue effects.
+                // Each effect restores its final position before the next;
+                // their relative order need not be preserved. Avoid shifting
+                // the whole map for each already-delivered edit.
+                rebuild.replacements.swap_remove(id);
+            }
+        }
+        let effects = rebuild.replacements;
+        let mut published_items = final_items.clone();
+        let indices: HashMap<_, _> = final_items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                item.as_event()
+                    .and_then(|event| event.event_id())
+                    .filter(|id| effects.contains_key(*id))
+                    .map(|id| (id.to_owned(), index))
+            })
+            .collect();
+        // A Set must replace a row carrying the previous event identity. Some
+        // projections discard identity for terminal non-message rows, so adding
+        // the terminal value then setting it to itself cannot deliver the effect.
+        for (id, (previous, _)) in &effects {
+            if let Some(&index) = indices.get(id).filter(|&&index| index >= subscriber_skip) {
+                published_items.set(index, previous.clone());
+            }
+        }
+        // Clear drops the original batch, including intermediate receipt Sets.
+        // The remote-event mapping already describes final_items; don't clear it.
+        self.items.clear();
+        self.pending_update_counts = TimelineUpdateCounts { operations: 1, item_occurrences: 0 };
+        if !final_items.is_empty() {
+            self.pending_update_counts.record(final_items.len() as u64);
+            self.items.append(published_items);
+        }
+        for (id, (previous, terminal)) in effects {
+            if let Some(&index) = indices.get(&id) {
+                let terminal = final_items[index].clone();
+                if index >= subscriber_skip {
+                    self.items.set(index, terminal);
+                    self.pending_update_counts.record(1);
+                    continue;
+                }
+                // Remove the original before exposing a temporary tail slot.
+                // Full/unbatched subscribers must never contain two instances
+                // of this event, even between individual diffs. SkipCount keeps
+                // at least one visible item in a nonempty timeline, so the tail
+                // still reaches the subscriber after removing this hidden item.
+                debug_assert!(subscriber_skip < self.items.len());
+                self.items.remove(index);
+                self.pending_update_counts.record(0);
+                self.emit_rebuild_tail_effect(previous, terminal.clone());
+                self.items.insert(index, terminal);
+                self.pending_update_counts.record(1);
+            } else {
+                self.emit_rebuild_tail_effect(previous, terminal);
+            }
+        }
+    }
+
+    fn emit_rebuild_tail_effect(
+        &mut self,
+        previous: Arc<TimelineItem>,
+        terminal: Arc<TimelineItem>,
+    ) {
+        let index = self.items.len();
+        self.items.push_back(previous);
+        self.items.set(index, terminal);
+        self.items.pop_back();
+        self.pending_update_counts.record(1);
+        self.pending_update_counts.record(1);
+        self.pending_update_counts.record(0);
+    }
+
     /// Get a reference to the timeline item at position `timeline_item_index`.
     pub fn get(&self, timeline_item_index: usize) -> Option<&Arc<TimelineItem>> {
         self.items.get(timeline_item_index)
@@ -287,12 +514,19 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
         timeline_item_index: usize,
         timeline_item: Arc<TimelineItem>,
     ) -> Arc<TimelineItem> {
-        self.items.set(timeline_item_index, timeline_item)
+        if self.rebuild_effects.is_some() {
+            let old = self.items[timeline_item_index].clone();
+            self.record_rebuild_effect(&old, &timeline_item);
+        }
+        let previous = self.items.set(timeline_item_index, timeline_item);
+        self.pending_update_counts.record(1);
+        previous
     }
 
     /// Remove a timeline item at position `timeline_item_index`.
     pub fn remove(&mut self, timeline_item_index: usize) -> Arc<TimelineItem> {
         let removed_timeline_item = self.items.remove(timeline_item_index);
+        self.pending_update_counts.record(0);
         self.all_remote_events.timeline_item_has_been_removed_at(timeline_item_index);
 
         removed_timeline_item
@@ -313,6 +547,7 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
         event_index: Option<usize>,
     ) {
         self.items.insert(timeline_item_index, timeline_item);
+        self.pending_update_counts.record(1);
         self.all_remote_events.timeline_item_has_been_inserted_at(timeline_item_index, event_index);
     }
 
@@ -326,6 +561,7 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
     /// [`EventMeta::timeline_item_index`] to learn more.
     pub fn push_front(&mut self, timeline_item: Arc<TimelineItem>, event_index: Option<usize>) {
         self.items.push_front(timeline_item);
+        self.pending_update_counts.record(1);
         self.all_remote_events.timeline_item_has_been_inserted_at(0, event_index);
     }
 
@@ -339,6 +575,7 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
     /// [`EventMeta::timeline_item_index`] to learn more.
     pub fn push_back(&mut self, timeline_item: Arc<TimelineItem>, event_index: Option<usize>) {
         self.items.push_back(timeline_item);
+        self.pending_update_counts.record(1);
         self.all_remote_events
             .timeline_item_has_been_inserted_at(self.items.len().saturating_sub(1), event_index);
     }
@@ -426,6 +663,15 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
     /// Clear all timeline items and all remote events.
     pub fn clear(&mut self) {
         self.items.clear();
+        // ObservableVectorTransaction::clear discards earlier pending diffs.
+        self.pending_update_counts = TimelineUpdateCounts { operations: 1, item_occurrences: 0 };
+        self.all_remote_events.clear();
+    }
+
+    /// Clear remote-event metadata after removing the corresponding timeline
+    /// items, including metadata for events hidden by the timeline filter.
+    pub fn clear_remote_events(&mut self) {
+        debug_assert!(!self.items.iter().any(|item| item.is_remote_event()));
         self.all_remote_events.clear();
     }
 
@@ -436,7 +682,11 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
         F: FnMut(ObservableItemsTransactionEntry<'_, 'observable_items>),
     {
         self.items.for_each(|entry| {
-            f(ObservableItemsTransactionEntry { entry, all_remote_events: self.all_remote_events })
+            f(ObservableItemsTransactionEntry {
+                entry,
+                all_remote_events: self.all_remote_events,
+                update_counts: &mut self.pending_update_counts,
+            })
         })
     }
 
@@ -492,7 +742,8 @@ impl<'observable_items> ObservableItemsTransaction<'observable_items> {
     /// Commit this transaction, persisting the changes and notifying
     /// subscribers.
     pub fn commit(self) {
-        self.items.commit()
+        self.items.commit();
+        self.committed_update_counts.add(self.pending_update_counts);
     }
 }
 
@@ -683,6 +934,7 @@ pub struct ObservableItemsTransactionEntry<'observable_transaction_items, 'obser
         Arc<TimelineItem>,
     >,
     all_remote_events: &'observable_transaction_items mut AllRemoteEvents,
+    update_counts: &'observable_transaction_items mut TimelineUpdateCounts,
 }
 
 impl ObservableItemsTransactionEntry<'_, '_> {
@@ -691,6 +943,7 @@ impl ObservableItemsTransactionEntry<'_, '_> {
         let entry_index = ObservableVectorTransactionEntry::index(&this.entry);
 
         ObservableVectorTransactionEntry::remove(this.entry);
+        this.update_counts.record(0);
         this.all_remote_events.timeline_item_has_been_removed_at(entry_index);
     }
 }
@@ -909,6 +1162,123 @@ mod observable_items_tests {
         assert_next_matches!(subscriber, VectorDiff::PushBack { value: event } => {
             assert_event_id!(event, "$ev0");
         });
+    }
+
+    fn count_observed_diffs(diffs: &[VectorDiff<Arc<TimelineItem>>]) -> TimelineUpdateCounts {
+        let mut counts = TimelineUpdateCounts::default();
+        for diff in diffs {
+            let occurrences = match diff {
+                VectorDiff::Append { values } | VectorDiff::Reset { values } => values.len() as u64,
+                VectorDiff::PushFront { .. }
+                | VectorDiff::PushBack { .. }
+                | VectorDiff::Insert { .. }
+                | VectorDiff::Set { .. } => 1,
+                VectorDiff::Clear
+                | VectorDiff::PopFront
+                | VectorDiff::PopBack
+                | VectorDiff::Remove { .. }
+                | VectorDiff::Truncate { .. } => 0,
+            };
+            counts.record(occurrences);
+        }
+        counts
+    }
+
+    #[test]
+    fn test_update_counts_match_committed_diffs() {
+        let mut items = ObservableItems::new();
+        let mut subscriber = items.subscribe().into_batched_stream();
+
+        let mut transaction = items.transaction();
+        transaction.push_back(item("$ev0"), None);
+        transaction.push_front(item("$ev1"), None);
+        transaction.insert(1, item("$ev2"), None);
+        transaction.replace(0, item("$ev3"));
+        transaction.remove(1);
+        // The associated function item is not higher-ranked over the entry's
+        // borrow lifetime; replacing this closure fails to type-check.
+        #[allow(clippy::redundant_closure)]
+        transaction.for_each(|entry| ObservableItemsTransactionEntry::remove(entry));
+        transaction.commit();
+
+        assert_eq!(
+            items.update_counts(),
+            TimelineUpdateCounts { operations: 7, item_occurrences: 4 }
+        );
+        assert_next_matches!(subscriber, diffs => {
+            assert_eq!(items.update_counts(), count_observed_diffs(&diffs));
+        });
+        assert_pending!(subscriber);
+    }
+
+    #[test]
+    fn test_update_counts_discard_rolled_back_and_cleared_diffs() {
+        let mut items = ObservableItems::new();
+        let mut subscriber = items.subscribe().into_batched_stream();
+
+        // Dropping a transaction publishes nothing and counts nothing.
+        {
+            let mut transaction = items.transaction();
+            transaction.push_back(item("$ev0"), None);
+            transaction.clear();
+            transaction.push_back(item("$ev1"), None);
+        }
+        assert_eq!(items.update_counts(), TimelineUpdateCounts::default());
+        assert_pending!(subscriber);
+
+        let mut transaction = items.transaction();
+        transaction.push_back(item("$ev0"), None);
+        transaction.replace(0, item("$ev1"));
+        transaction.clear();
+        transaction.clear();
+        transaction.push_front(item("$ev2"), None);
+        transaction.commit();
+
+        // clear() discards all earlier batched diffs, including an earlier clear.
+        assert_eq!(
+            items.update_counts(),
+            TimelineUpdateCounts { operations: 2, item_occurrences: 1 }
+        );
+        assert_next_matches!(subscriber, diffs => {
+            assert_eq!(items.update_counts(), count_observed_diffs(&diffs));
+        });
+        assert_pending!(subscriber);
+
+        items.transaction().commit();
+        assert_eq!(
+            items.update_counts(),
+            TimelineUpdateCounts { operations: 2, item_occurrences: 1 }
+        );
+        assert_pending!(subscriber);
+    }
+
+    #[test]
+    fn test_update_counts_include_direct_entry_replacements() {
+        let mut items = ObservableItems::new();
+        let mut transaction = items.transaction();
+        transaction.push_back(item("$ev0"), None);
+        transaction.push_back(item("$ev1"), None);
+        transaction.commit();
+        let before = items.update_counts();
+        let mut subscriber = items.subscribe().into_batched_stream();
+
+        items.replace(0, item("$ev2"));
+        {
+            let mut entries = items.entries();
+            ObservableItemsEntry::replace(&mut entries.next().unwrap(), item("$ev3"));
+        }
+        items.for_each(|mut entry| {
+            ObservableItemsEntry::replace(&mut entry, item("$ev4"));
+        });
+
+        assert_next_matches!(subscriber, diffs => {
+            let observed = count_observed_diffs(&diffs);
+            assert_eq!(observed, TimelineUpdateCounts { operations: 4, item_occurrences: 4 });
+            let mut expected = before;
+            expected.add(observed);
+            assert_eq!(items.update_counts(), expected);
+        });
+        assert_pending!(subscriber);
     }
 
     #[test]

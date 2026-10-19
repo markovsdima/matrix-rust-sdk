@@ -544,10 +544,57 @@ impl EventFocusedCache {
 
     /// Subscribe to updates from this event-focused timeline.
     pub async fn subscribe(&self) -> (Vec<Event>, Receiver<TimelineVectorDiffs>) {
-        let inner = self.inner.read().await;
+        let mut inner = self.inner.write().await;
+        inner.notify_subscribers(EventsOrigin::Cache);
         let events = inner.chunk.events().map(|(_position, item)| item.clone()).collect();
         let recv = inner.sender.subscribe();
         (events, recv)
+    }
+
+    /// Subscribe to this focus and the room's aggregation/control updates at a
+    /// consistent recovery boundary. The room cache must own this focus.
+    pub(in crate::event_cache) async fn subscribe_with_room_updates(
+        &self,
+        room: &super::room::RoomEventCache,
+    ) -> Result<super::room::FocusedTimelineSnapshot> {
+        // Pagination holds this lock while Room::messages saves fetched events
+        // into the room cache. Keep the same focus -> room lock order.
+        let mut inner = self.inner.write().await;
+        inner.notify_subscribers(EventsOrigin::Cache);
+        let events = inner.chunk.events().map(|(_, event)| event.clone()).collect();
+        let receiver = inner.sender.subscribe();
+        let (mut snapshot, repairs) = room.focused_snapshot(events, receiver).await?;
+        if !repairs.is_empty() {
+            // Repair the backing focus as well as its snapshot. Otherwise a
+            // pending decryption result could overwrite a restored redaction.
+            // Walk positions once, rather than searching the growing chunk for
+            // each repaired event. The focus lock is still held throughout.
+            let mut repairs = repairs.into_iter().peekable();
+            let replacements: Vec<_> = inner
+                .chunk
+                .events()
+                .enumerate()
+                .filter_map(|(index, (position, _))| {
+                    if repairs.peek().is_some_and(|(repair_index, _)| *repair_index == index) {
+                        let (_, event) = repairs.next().unwrap();
+                        Some((position, event))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (position, event) in replacements {
+                inner
+                    .chunk
+                    .replace_event_at(position, event)
+                    .expect("position was read under the same focus lock");
+            }
+            inner.propagate_changes();
+            inner.notify_subscribers(EventsOrigin::Cache);
+            // These repairs are already represented in the returned snapshot.
+            snapshot.updates = inner.sender.subscribe();
+        }
+        Ok(snapshot)
     }
 
     /// Check if we've hit the start of the timeline (no more backward
@@ -617,3 +664,6 @@ impl std::fmt::Debug for EventFocusedCache {
         f.debug_struct("EventFocusedCache").finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests;

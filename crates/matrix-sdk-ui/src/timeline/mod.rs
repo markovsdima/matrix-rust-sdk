@@ -885,7 +885,6 @@ struct TimelineDropHandle {
     _room_update_join_handle: BackgroundTaskHandle,
     _local_echo_listener_handle: BackgroundTaskHandle,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
-    _focus_drop_handle: Option<BackgroundTaskHandle>,
     _crypto_drop_handles: CryptoDropHandles,
 }
 

@@ -44,15 +44,55 @@ pub(super) struct ReadReceipts {
     /// type.
     latest_by_user: HashMap<OwnedUserId, HashMap<ReceiptType, (OwnedEventId, Receipt)>>,
 
+    /// Receipts recovered after live-cache lag whose targets are outside the
+    /// snapshot. Bound to one entry per cached user/type, cleared with metadata.
+    /// An unknown target can be older or newer; without positions or timestamps
+    /// we conservatively retain persisted state over implicit inference. Normal
+    /// initial timelines do not use this protection. Loading the target, a
+    /// newer timestamp, or a store-confirmed notification for the same
+    /// user/type/thread releases protection. A Main fallback also yields to a
+    /// store-confirmed Unthreaded receipt, the preferred key for that timeline.
+    authoritative_pending: HashMap<OwnedUserId, HashMap<ReceiptType, PendingReceiptSource>>,
+
     /// A sender to notify of changes to the receipts of our own user.
     own_user_read_receipts_changed_sender: watch::Sender<()>,
+
+    /// Numeric work counters, retained across metadata clears. These count
+    /// visited entries, not retained events, and contain no event/user data.
+    search_counts: ReadReceiptSearchCounts,
+}
+
+/// Why an unloaded stored receipt is protected during recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingReceiptSource {
+    /// Keep the authoritative thread even if the item's cached receipt still
+    /// has another thread: updates to the same event ID can leave it unchanged.
+    Thread(ReceiptThread),
+    /// Our unthreaded receipt was absent, so initial loading used Main instead.
+    OwnMainFallback,
+}
+
+/// Cumulative receipt work. Membership guards for authoritative receipts are
+/// separate from these positional/display searches and are not included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::timeline) struct ReadReceiptSearchCounts {
+    pub position_event_visits: u64,
+    pub fallback_item_visits: u64,
+    pub compute_event_visits: u64,
+    pub deferred_item_adds: u64,
+    pub missing_item_targets: u64,
 }
 
 impl ReadReceipts {
+    pub(super) fn search_counts(&self) -> ReadReceiptSearchCounts {
+        self.search_counts
+    }
+
     /// Empty the caches.
     pub(super) fn clear(&mut self) {
         self.by_event.clear();
         self.latest_by_user.clear();
+        self.authoritative_pending.clear();
     }
 
     /// Subscribe to changes in the read receipts of our own user.
@@ -98,9 +138,74 @@ impl ReadReceipts {
         &mut self,
         new_receipt: FullReceipt<'_>,
         is_own_user_id: bool,
+        from_store: bool,
+        protect_unknown: Option<PendingReceiptSource>,
         timeline_items: &mut ObservableItemsTransaction<'_>,
     ) {
         let all_events = timeline_items.all_remote_events();
+
+        if from_store
+            && !all_events.iter().any(|event| event.event_id == new_receipt.event_id)
+            && self.get_latest(new_receipt.user_id, &new_receipt.receipt_type).is_some_and(
+                |(old_event_id, old_receipt)| {
+                    all_events.iter().any(|event| event.event_id == *old_event_id)
+                        && old_receipt
+                            .ts
+                            .zip(new_receipt.receipt.ts)
+                            .is_some_and(|(old, new)| old > new)
+                },
+            )
+        {
+            // An unloaded stored receipt can also point into older history.
+            // Preserve a newer known implicit receipt when timestamps provide
+            // ordering evidence; don't turn it into an artificial pending one.
+            return;
+        }
+
+        if self.is_authoritative_pending(new_receipt.user_id, &new_receipt.receipt_type, all_events)
+            && !from_store
+        {
+            // Store state can be ahead of this snapshot. Neither a queued old
+            // receipt nor an implicit receipt on an old sender event may move
+            // it backwards while its target's position is still unknown.
+            let newer_timestamp = self
+                .get_latest(new_receipt.user_id, &new_receipt.receipt_type)
+                .and_then(|(_, receipt)| receipt.ts.zip(new_receipt.receipt.ts))
+                .is_some_and(|(old, new)| new > old);
+            if !newer_timestamp {
+                return;
+            }
+        }
+        // Refreshing a Main fallback from the store does not make it an
+        // independent Main receipt. Preserve its scope until it is replaced
+        // or acknowledged; a later Unthreaded confirmation must still win.
+        let protect_unknown = protect_unknown.map(|source| {
+            if new_receipt.receipt.thread == ReceiptThread::Main
+                && self
+                    .authoritative_pending
+                    .get(new_receipt.user_id)
+                    .and_then(|types| types.get(&new_receipt.receipt_type))
+                    == Some(&PendingReceiptSource::OwnMainFallback)
+            {
+                PendingReceiptSource::OwnMainFallback
+            } else {
+                source
+            }
+        });
+        if let Some(types) = self.authoritative_pending.get_mut(new_receipt.user_id) {
+            types.remove(&new_receipt.receipt_type);
+            if types.is_empty() {
+                self.authoritative_pending.remove(new_receipt.user_id);
+            }
+        }
+        if let Some(source) = protect_unknown
+            && !all_events.iter().any(|event| event.event_id == new_receipt.event_id)
+        {
+            self.authoritative_pending
+                .entry(new_receipt.user_id.to_owned())
+                .or_default()
+                .insert(new_receipt.receipt_type.clone(), source);
+        }
 
         // Get old receipt.
         let old_receipt = self.get_latest(new_receipt.user_id, &new_receipt.receipt_type);
@@ -116,7 +221,7 @@ impl ReadReceipts {
             return;
         }
 
-        let old_event_id = old_receipt.map(|(event_id, _)| event_id);
+        let old_event_id = old_receipt.map(|(event_id, _)| event_id.clone());
 
         // Find receipts positions.
         let mut old_receipt_pos = None;
@@ -127,7 +232,8 @@ impl ReadReceipts {
         let mut new_item_event_id = None;
 
         for (pos, event) in all_events.iter().rev().enumerate() {
-            if old_receipt_pos.is_none() && old_event_id == Some(&event.event_id) {
+            self.search_counts.position_event_visits += 1;
+            if old_receipt_pos.is_none() && old_event_id.as_ref() == Some(&event.event_id) {
                 old_receipt_pos = Some(pos);
             }
 
@@ -165,7 +271,17 @@ impl ReadReceipts {
 
         // Check if the old receipt is more recent than the new receipt.
         if let Some(old_receipt_pos) = old_receipt_pos {
-            let Some(new_receipt_pos) = new_receipt_pos else {
+            if let Some(new_receipt_pos) = new_receipt_pos {
+                if old_receipt_pos < new_receipt_pos {
+                    // The old receipt is more recent than the new one.
+                    if !is_own_user_id {
+                        trace!(
+                            "the previous read receipt is more recent than the new one, exiting"
+                        );
+                    }
+                    return;
+                }
+            } else if !from_store {
                 // The old receipt is more recent since we can't find the new receipt in the
                 // timeline and we supposedly have all events since the end of the timeline.
                 if !is_own_user_id {
@@ -173,14 +289,6 @@ impl ReadReceipts {
                         "we had a previous read receipt, but couldn't find the event \
                          targeted by the new read receipt in the timeline, exiting"
                     );
-                }
-                return;
-            };
-
-            if old_receipt_pos < new_receipt_pos {
-                // The old receipt is more recent than the new one.
-                if !is_own_user_id {
-                    trace!("the previous read receipt is more recent than the new one, exiting");
                 }
                 return;
             }
@@ -207,7 +315,7 @@ impl ReadReceipts {
             );
 
             // Remove the old receipt from the old event.
-            if let Some(old_event_id) = old_event_id.cloned() {
+            if let Some(old_event_id) = old_event_id {
                 self.remove_event_receipt_for_user(&old_event_id, new_receipt.user_id);
             }
 
@@ -237,23 +345,141 @@ impl ReadReceipts {
             return;
         }
 
+        // Metadata is registered before a newly loaded event is rendered. Its
+        // receipt is already in `by_event`, and `compute_event_receipts` will
+        // put it on the newly created item. Searching the current item vector
+        // here cannot succeed and would scan a growing prefix on every append.
+        // Only the two pre-insertion callers opt into this path; unexpected
+        // missing items in explicit receipt updates remain diagnosed below.
+        let new_item_pending = new_receipt.target_is_pending
+            && new_item_pos.is_none()
+            && new_item_event_id.as_deref() == Some(new_receipt.event_id);
         let timeline_update = ReadReceiptTimelineUpdate {
             old_item_pos,
             old_event_id: old_item_event_id,
             new_item_pos,
             new_event_id: new_item_event_id,
+            new_item_pending,
         };
 
         timeline_update.apply(
             timeline_items,
             new_receipt.user_id.to_owned(),
             new_receipt.receipt.clone(),
+            &mut self.search_counts,
         );
     }
 
     /// Returns the cached receipts by user for a given `event_id`.
     fn get_event_receipts(&self, event_id: &EventId) -> Option<&IndexMap<OwnedUserId, Receipt>> {
         self.by_event.get(event_id)
+    }
+
+    /// A notification matching the store acknowledges this user/type/thread,
+    /// including when its target has changed since recovery. Release protection
+    /// before applying it with ordinary live ordering; otherwise a pending old
+    /// target would reject the new value when timestamps are absent or equal.
+    /// Another thread must not release the current receipt's protection, except
+    /// for Unthreaded superseding our Main fallback: main and unthreaded receipts
+    /// share the same user/type cache entry.
+    pub(super) fn acknowledge_recovery_receipt(
+        &mut self,
+        user: &UserId,
+        receipt_type: &ReceiptType,
+        thread: &ReceiptThread,
+    ) {
+        let Some(types) = self.authoritative_pending.get_mut(user) else { return };
+        let acknowledged = types.get(receipt_type).is_some_and(|source| match source {
+            PendingReceiptSource::Thread(protected_thread) => protected_thread == thread,
+            PendingReceiptSource::OwnMainFallback => {
+                matches!(thread, ReceiptThread::Main | ReceiptThread::Unthreaded)
+            }
+        });
+        if acknowledged {
+            types.remove(receipt_type);
+            if types.is_empty() {
+                self.authoritative_pending.remove(user);
+            }
+        }
+    }
+
+    fn is_authoritative_pending(
+        &self,
+        user_id: &UserId,
+        receipt_type: &ReceiptType,
+        all_events: &AllRemoteEvents,
+    ) -> bool {
+        self.authoritative_pending
+            .get(user_id)
+            .is_some_and(|types| types.contains_key(receipt_type))
+            && self.get_latest(user_id, receipt_type).is_some_and(|(event_id, _)| {
+                !all_events.iter().any(|event| event.event_id == *event_id)
+            })
+    }
+
+    fn authoritative_pending_order(
+        &self,
+        user_id: &UserId,
+        all_events: &AllRemoteEvents,
+    ) -> Option<Ordering> {
+        let public_pending = self.is_authoritative_pending(user_id, &ReceiptType::Read, all_events);
+        let private_pending =
+            self.is_authoritative_pending(user_id, &ReceiptType::ReadPrivate, all_events);
+        if (public_pending || private_pending)
+            && let Some((public, private)) = self
+                .get_latest(user_id, &ReceiptType::Read)
+                .and_then(|(_, receipt)| receipt.ts)
+                .zip(
+                    self.get_latest(user_id, &ReceiptType::ReadPrivate)
+                        .and_then(|(_, receipt)| receipt.ts),
+                )
+            && public != private
+        {
+            return Some(public.cmp(&private));
+        }
+        match (public_pending, private_pending) {
+            (true, false) => Some(Ordering::Greater),
+            (false, true) => Some(Ordering::Less),
+            _ => None,
+        }
+    }
+
+    /// Get the visible receipt target using the receipt caches and event order
+    /// from the same state (which may be an uncommitted rebuild transaction).
+    fn latest_user_read_receipt_timeline_event_id(
+        &self,
+        user_id: &UserId,
+        all_remote_events: &AllRemoteEvents,
+    ) -> Option<OwnedEventId> {
+        // We only need to use the local map, since receipts for known events are
+        // already loaded from the store.
+        let public_read_receipt = self.get_latest(user_id, &ReceiptType::Read);
+        let private_read_receipt = self.get_latest(user_id, &ReceiptType::ReadPrivate);
+
+        // Let's assume that a private read receipt should be more recent than a public
+        // read receipt, otherwise there's no point in the private read receipt,
+        // and use it as default.
+        let (latest_receipt_id, _) = match self
+            .authoritative_pending_order(user_id, all_remote_events)
+            .unwrap_or_else(|| {
+                TimelineMetadata::compare_optional_receipts(
+                    public_read_receipt,
+                    private_read_receipt,
+                    all_remote_events,
+                )
+            }) {
+            Ordering::Greater => public_read_receipt?,
+            Ordering::Less => private_read_receipt?,
+            _ => unreachable!(),
+        };
+
+        // Find the corresponding visible event.
+        all_remote_events
+            .iter()
+            .rev()
+            .skip_while(|ev| ev.event_id != *latest_receipt_id)
+            .find(|ev| ev.visible && ev.can_show_read_receipts)
+            .map(|ev| ev.event_id.clone())
     }
 
     /// Mark the given event as seen by the user with the given receipt.
@@ -283,7 +509,7 @@ impl ReadReceipts {
     /// on the following events that are filtered out (not visible).
     #[instrument(skip(self, timeline_items, at_end))]
     pub(super) fn compute_event_receipts(
-        &self,
+        &mut self,
         event_id: &EventId,
         timeline_items: &mut ObservableItemsTransaction<'_>,
         at_end: bool,
@@ -318,6 +544,7 @@ impl ReadReceipts {
         let mut prev_event_and_item_index = None;
 
         for meta in events_iter.by_ref() {
+            self.search_counts.compute_event_visits += 1;
             if meta.event_id == event_id {
                 break;
             }
@@ -329,8 +556,10 @@ impl ReadReceipts {
         // Include receipts from all the following events that are hidden or can't show
         // read receipts.
         let mut hidden = Vec::new();
-        for hidden_receipt_event_meta in
-            events_iter.take_while(|meta| !meta.visible || !meta.can_show_read_receipts)
+        let mut hidden_event_visits = 0;
+        for hidden_receipt_event_meta in events_iter
+            .inspect(|_| hidden_event_visits += 1)
+            .take_while(|meta| !meta.visible || !meta.can_show_read_receipts)
         {
             if let Some(event_receipts) =
                 self.get_event_receipts(&hidden_receipt_event_meta.event_id)
@@ -339,6 +568,7 @@ impl ReadReceipts {
                 hidden.extend(event_receipts.clone());
             }
         }
+        self.search_counts.compute_event_visits += hidden_event_visits;
 
         // Steal hidden receipts from the previous timeline item, if it carried them.
         if let Some((prev_event_id, prev_item_index)) = prev_event_and_item_index {
@@ -357,8 +587,9 @@ impl ReadReceipts {
                         old_event_id: Some(prev_event_id.clone()),
                         new_item_pos: None,
                         new_event_id: None,
+                        new_item_pending: false,
                     };
-                    up.remove_old_receipt(timeline_items, user_id);
+                    up.remove_old_receipt(timeline_items, user_id, &mut self.search_counts);
                 }
             }
         }
@@ -377,6 +608,10 @@ struct FullReceipt<'a> {
     user_id: &'a UserId,
     receipt_type: ReceiptType,
     receipt: &'a Receipt,
+    /// The target's metadata has just been inserted, but its visible item has
+    /// not been created yet. Hidden targets can still move a receipt onto an
+    /// existing preceding visible item.
+    target_is_pending: bool,
 }
 
 /// A read receipt update in the timeline.
@@ -392,12 +627,20 @@ struct ReadReceiptTimelineUpdate {
     new_item_pos: Option<usize>,
     /// The new event that has the receipt of the user, if any.
     new_event_id: Option<OwnedEventId>,
+    /// An expected, not-yet-rendered target; its item constructor loads receipts
+    /// from the cache after this update finishes.
+    new_item_pending: bool,
 }
 
 impl ReadReceiptTimelineUpdate {
     /// Remove the old receipt from the corresponding timeline item.
     #[instrument(skip_all)]
-    fn remove_old_receipt(&mut self, items: &mut ObservableItemsTransaction<'_>, user_id: &UserId) {
+    fn remove_old_receipt(
+        &mut self,
+        items: &mut ObservableItemsTransaction<'_>,
+        user_id: &UserId,
+        counts: &mut ReadReceiptSearchCounts,
+    ) {
         let Some(event_id) = &self.old_event_id else {
             // Nothing to do.
             return;
@@ -407,6 +650,7 @@ impl ReadReceiptTimelineUpdate {
             items
                 .iter_remotes_region()
                 .rev()
+                .inspect(|_| counts.fallback_item_visits += 1)
                 .filter_map(|(nth, item)| Some((nth, item.as_event()?)))
                 .find_map(|(nth, event_item)| {
                     (event_item.event_id() == Some(event_id)).then_some(nth)
@@ -414,6 +658,7 @@ impl ReadReceiptTimelineUpdate {
         });
 
         let Some(item_pos) = item_pos else {
+            counts.missing_item_targets += 1;
             debug!(%event_id, %user_id, "inconsistent state: old event item for read receipt was not found");
             return;
         };
@@ -437,7 +682,7 @@ impl ReadReceiptTimelineUpdate {
                 );
             }
             trace!(%user_id, %event_id, "removed read receipt from event item");
-            items.replace(item_pos, TimelineItem::new(event_item, event_item_id));
+            items.replace_read_receipts(item_pos, TimelineItem::new(event_item, event_item_id));
         } else {
             warn!("received a read receipt for a local item, this should not be possible");
         }
@@ -450,17 +695,24 @@ impl ReadReceiptTimelineUpdate {
         items: &mut ObservableItemsTransaction<'_>,
         user_id: OwnedUserId,
         receipt: Receipt,
+        counts: &mut ReadReceiptSearchCounts,
     ) {
         let Some(event_id) = self.new_event_id else {
             // Nothing to do.
             return;
         };
 
+        if self.new_item_pending {
+            counts.deferred_item_adds += 1;
+            return;
+        }
+
         let old_item_pos = self.old_item_pos.unwrap_or(0);
 
         let item_pos = self.new_item_pos.or_else(|| {
             items
                 .iter_remotes_region()
+                .inspect(|_| counts.fallback_item_visits += 1)
                 // Don't iterate over all items if the `old_item_pos` is known: the `item_pos`
                 // for the new item is necessarily _after_ the old item.
                 .skip_while(|(nth, _)| *nth < old_item_pos)
@@ -474,6 +726,7 @@ impl ReadReceiptTimelineUpdate {
         });
 
         let Some(item_pos) = item_pos else {
+            counts.missing_item_targets += 1;
             debug!(
                 %event_id, %user_id,
                 "inconsistent state: new event item for read receipt was not found",
@@ -498,7 +751,7 @@ impl ReadReceiptTimelineUpdate {
         if let Some(remote_event_item) = event_item.as_remote_mut() {
             trace!(%user_id, %event_id, "added read receipt to event item");
             remote_event_item.read_receipts.insert(user_id, receipt);
-            items.replace(item_pos, TimelineItem::new(event_item, event_item_id));
+            items.replace_read_receipts(item_pos, TimelineItem::new(event_item, event_item_id));
         } else {
             warn!("received a read receipt for a local item, this should not be possible");
         }
@@ -510,9 +763,10 @@ impl ReadReceiptTimelineUpdate {
         items: &mut ObservableItemsTransaction<'_>,
         user_id: OwnedUserId,
         receipt: Receipt,
+        counts: &mut ReadReceiptSearchCounts,
     ) {
-        self.remove_old_receipt(items, &user_id);
-        self.add_new_receipt(items, user_id, receipt);
+        self.remove_old_receipt(items, &user_id, counts);
+        self.add_new_receipt(items, user_id, receipt, counts);
     }
 }
 
@@ -521,6 +775,8 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
         &mut self,
         receipt_event_content: ReceiptEventContent,
         own_user_id: &UserId,
+        from_store: bool,
+        protect_unknown: bool,
     ) {
         trace!("handling explicit read receipts");
         let own_receipt_thread = self.focus.receipt_thread();
@@ -585,8 +841,10 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
                                         continue;
                                     }
 
-                                    self.items
-                                        .replace(item_pos, TimelineItem::new(new_item, item_id));
+                                    self.items.replace_read_receipts(
+                                        item_pos,
+                                        TimelineItem::new(new_item, item_id),
+                                    );
                                 }
 
                                 // Couldn't find an item for this new read receipt; process the
@@ -605,16 +863,22 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
                     }
 
                     let is_own_user_id = user_id == own_user_id;
+
                     let full_receipt = FullReceipt {
                         event_id: &event_id,
                         user_id: &user_id,
                         receipt_type: receipt_type.clone(),
                         receipt: &receipt,
+                        target_is_pending: false,
                     };
 
+                    let protection = protect_unknown
+                        .then(|| PendingReceiptSource::Thread(receipt.thread.clone()));
                     self.meta.read_receipts.maybe_update_read_receipt(
                         full_receipt,
                         is_own_user_id,
+                        from_store,
+                        protection,
                         &mut self.items,
                     );
                 }
@@ -669,11 +933,14 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
                 user_id: &user_id,
                 receipt_type: ReceiptType::Read,
                 receipt: &receipt,
+                target_is_pending: true,
             };
 
             self.meta.read_receipts.maybe_update_read_receipt(
                 full_receipt,
                 user_id == own_user_id,
+                false,
+                None,
                 &mut self.items,
             );
         }
@@ -703,14 +970,21 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
         let mut receipt = Receipt::new(timestamp);
         receipt.thread = self.focus.receipt_thread();
 
-        let full_receipt =
-            FullReceipt { event_id, user_id, receipt_type: ReceiptType::Read, receipt: &receipt };
+        let full_receipt = FullReceipt {
+            event_id,
+            user_id,
+            receipt_type: ReceiptType::Read,
+            receipt: &receipt,
+            target_is_pending: true,
+        };
 
         let is_own_event = sender.is_some_and(|sender| sender == self.meta.own_user_id);
 
         self.meta.read_receipts.maybe_update_read_receipt(
             full_receipt,
             is_own_event,
+            false,
+            None,
             &mut self.items,
         );
     }
@@ -765,17 +1039,31 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
 
         trace!("replacing read receipts with the new ones");
         remote_prev_event_item.read_receipts = read_receipts;
-        self.items.replace(prev_item_pos, TimelineItem::new(prev_event_item, prev_event_item_id));
+        self.items.replace_read_receipts(
+            prev_item_pos,
+            TimelineItem::new(prev_event_item, prev_event_item_id),
+        );
     }
 }
 
-impl<P: RoomDataProvider> TimelineState<P> {
+impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
+    /// Get the visible receipt target from this transaction's current state.
+    pub(super) fn latest_user_read_receipt_timeline_event_id(
+        &self,
+        user_id: &UserId,
+    ) -> Option<OwnedEventId> {
+        self.meta
+            .read_receipts
+            .latest_user_read_receipt_timeline_event_id(user_id, self.items.all_remote_events())
+    }
+
     /// Populates our own latest read receipt in the in-memory by-user read
     /// receipt cache.
     pub(super) async fn populate_initial_user_receipt(
         &mut self,
         room_data_provider: &P,
         receipt_type: ReceiptType,
+        recovering_from_lag: bool,
     ) {
         let own_user_id = room_data_provider.own_user_id().to_owned();
 
@@ -786,18 +1074,39 @@ impl<P: RoomDataProvider> TimelineState<P> {
             .load_user_receipt(receipt_type.clone(), receipt_thread, &own_user_id)
             .await;
 
-        if wants_unthreaded_receipts && read_receipt.is_none() {
+        let uses_main_fallback = wants_unthreaded_receipts && read_receipt.is_none();
+        if uses_main_fallback {
             // Fallback to the one in the main thread.
             read_receipt = room_data_provider
                 .load_user_receipt(receipt_type.clone(), ReceiptThread::Main, &own_user_id)
                 .await;
         }
 
-        if let Some(read_receipt) = read_receipt {
-            self.meta.read_receipts.upsert_latest(own_user_id, receipt_type, read_receipt);
+        if let Some((event_id, receipt)) = read_receipt {
+            self.meta.read_receipts.maybe_update_read_receipt(
+                FullReceipt {
+                    event_id: &event_id,
+                    user_id: &own_user_id,
+                    receipt_type,
+                    receipt: &receipt,
+                    target_is_pending: false,
+                },
+                true,
+                recovering_from_lag,
+                recovering_from_lag.then(|| {
+                    if uses_main_fallback {
+                        PendingReceiptSource::OwnMainFallback
+                    } else {
+                        PendingReceiptSource::Thread(receipt.thread.clone())
+                    }
+                }),
+                &mut self.items,
+            );
         }
     }
+}
 
+impl<P: RoomDataProvider> TimelineState<P> {
     /// Get the latest read receipt for the given user.
     ///
     /// Useful to get the latest read receipt, whether it's private or public.
@@ -834,11 +1143,17 @@ impl<P: RoomDataProvider> TimelineState<P> {
         // Let's assume that a private read receipt should be more recent than a public
         // read receipt (otherwise there's no point in the private read receipt),
         // and use it as the default.
-        match TimelineMetadata::compare_optional_receipts(
-            public_read_receipt.as_ref(),
-            private_read_receipt.as_ref(),
-            all_remote_events,
-        ) {
+        match self
+            .meta
+            .read_receipts
+            .authoritative_pending_order(user_id, all_remote_events)
+            .unwrap_or_else(|| {
+                TimelineMetadata::compare_optional_receipts(
+                    public_read_receipt.as_ref(),
+                    private_read_receipt.as_ref(),
+                    all_remote_events,
+                )
+            }) {
             Ordering::Greater => public_read_receipt,
             Ordering::Less => private_read_receipt,
             _ => unreachable!(),
@@ -851,33 +1166,9 @@ impl<P: RoomDataProvider> TimelineState<P> {
         &self,
         user_id: &UserId,
     ) -> Option<OwnedEventId> {
-        // We only need to use the local map, since receipts for known events are
-        // already loaded from the store.
-        let public_read_receipt = self.meta.read_receipts.get_latest(user_id, &ReceiptType::Read);
-        let private_read_receipt =
-            self.meta.read_receipts.get_latest(user_id, &ReceiptType::ReadPrivate);
-
-        // Let's assume that a private read receipt should be more recent than a public
-        // read receipt, otherwise there's no point in the private read receipt,
-        // and use it as default.
-        let (latest_receipt_id, _) = match TimelineMetadata::compare_optional_receipts(
-            public_read_receipt,
-            private_read_receipt,
-            self.items.all_remote_events(),
-        ) {
-            Ordering::Greater => public_read_receipt?,
-            Ordering::Less => private_read_receipt?,
-            _ => unreachable!(),
-        };
-
-        // Find the corresponding visible event.
-        self.items
-            .all_remote_events()
-            .iter()
-            .rev()
-            .skip_while(|ev| ev.event_id != *latest_receipt_id)
-            .find(|ev| ev.visible && ev.can_show_read_receipts)
-            .map(|ev| ev.event_id.clone())
+        self.meta
+            .read_receipts
+            .latest_user_read_receipt_timeline_event_id(user_id, self.items.all_remote_events())
     }
 }
 
@@ -977,5 +1268,79 @@ impl TimelineMetadata {
         }
 
         Ordering::Less
+    }
+}
+
+#[cfg(test)]
+mod receipt_search_tests {
+    use matrix_sdk_test::BOB;
+    use ruma::{event_id, events::receipt::Receipt};
+
+    use super::{FullReceipt, ReadReceipts, ReceiptType};
+    use crate::timeline::controller::{ObservableItems, metadata::EventMeta};
+
+    #[test]
+    fn pending_target_receipt_is_loaded_by_item_creation_without_missing_item_search() {
+        let event_id = event_id!("$pending-receipt-target");
+        let mut items = ObservableItems::new();
+        let mut items = items.transaction();
+        items.push_back_remote_event(EventMeta::new(event_id.to_owned(), true, true, None));
+        let mut receipts = ReadReceipts::default();
+        let receipt = Receipt::default();
+
+        receipts.maybe_update_read_receipt(
+            FullReceipt {
+                event_id,
+                user_id: *BOB,
+                receipt_type: ReceiptType::Read,
+                receipt: &receipt,
+                target_is_pending: true,
+            },
+            false,
+            false,
+            None,
+            &mut items,
+        );
+
+        let rendered_receipts = receipts.compute_event_receipts(event_id, &mut items, true);
+        let rendered = rendered_receipts.get(*BOB).expect("new item carries the pending receipt");
+        assert_eq!(rendered.ts, receipt.ts);
+        assert_eq!(rendered.thread, receipt.thread);
+        assert_eq!(receipts.get_latest(*BOB, &ReceiptType::Read).unwrap().0, event_id);
+        let counts = receipts.search_counts();
+        assert_eq!(counts.position_event_visits, 1);
+        assert_eq!(counts.deferred_item_adds, 1);
+        assert_eq!(counts.fallback_item_visits, 0);
+        assert_eq!(counts.compute_event_visits, 0);
+        assert_eq!(counts.missing_item_targets, 0);
+
+        receipts.clear();
+        assert_eq!(receipts.search_counts(), counts, "numeric diagnostics survive rebuild clears");
+    }
+
+    #[test]
+    fn unexpected_missing_explicit_receipt_item_remains_diagnosed() {
+        let event_id = event_id!("$unexpectedly-missing-receipt-target");
+        let mut items = ObservableItems::new();
+        let mut items = items.transaction();
+        // Model a broken mapping. Unlike a pending insertion, this does not
+        // opt into deferral and must retain the fallback/inconsistency path.
+        items.push_back_remote_event(EventMeta::new(event_id.to_owned(), true, true, None));
+        let mut receipts = ReadReceipts::default();
+        receipts.maybe_update_read_receipt(
+            FullReceipt {
+                event_id,
+                user_id: *BOB,
+                receipt_type: ReceiptType::Read,
+                receipt: &Receipt::default(),
+                target_is_pending: false,
+            },
+            false,
+            false,
+            None,
+            &mut items,
+        );
+        assert_eq!(receipts.search_counts().deferred_item_adds, 0);
+        assert_eq!(receipts.search_counts().missing_item_targets, 1);
     }
 }

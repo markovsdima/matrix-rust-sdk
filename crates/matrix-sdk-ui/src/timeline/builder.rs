@@ -27,7 +27,10 @@ use crate::{
     timeline::{
         TimelineReadReceiptTracking,
         controller::{InitFocusResult, spawn_crypto_tasks},
-        tasks::{room_event_cache_updates_task, room_send_queue_update_task},
+        tasks::{
+            focused_timeline_updates_task, room_event_cache_updates_task,
+            room_send_queue_update_task,
+        },
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -162,7 +165,15 @@ impl TimelineBuilder {
         room.client().event_cache().subscribe()?;
 
         let (room_event_cache, event_cache_drop) = room.event_cache().await?;
-        let (_, event_subscriber) = room_event_cache.subscribe().await?;
+        // Focused initialization takes its own coordinated snapshot below.
+        // Cloning the full room history here only serves a Live timeline.
+        let (initial_room_events, event_subscriber) = if matches!(focus, TimelineFocus::Live { .. })
+        {
+            let (events, receiver) = room_event_cache.subscribe().await?;
+            (events, Some(receiver))
+        } else {
+            (Vec::new(), None)
+        };
 
         let is_room_encrypted = room
             .latest_encryption_state()
@@ -180,8 +191,8 @@ impl TimelineBuilder {
             settings,
         );
 
-        let InitFocusResult { focus_task, retry_events } =
-            controller.init_focus(&focus, &room_event_cache).await?;
+        let InitFocusResult { focused_receivers, retry_events } =
+            controller.init_focus(&focus, &room_event_cache, initial_room_events).await?;
 
         let room_update_join_handle = room
             .client()
@@ -196,12 +207,29 @@ impl TimelineBuilder {
                 );
                 span.follows_from(Span::current());
 
-                room_event_cache_updates_task(
-                    room_event_cache.clone(),
-                    controller.clone(),
-                    event_subscriber,
-                    focus.clone(),
-                )
+                let room_event_cache = room_event_cache.clone();
+                let controller = controller.clone();
+                let focus = focus.clone();
+                async move {
+                    if let Some((focused, room_updates)) = focused_receivers {
+                        focused_timeline_updates_task(
+                            room_event_cache,
+                            controller,
+                            room_updates,
+                            focused,
+                            focus,
+                        )
+                        .await;
+                    } else if let Some(event_subscriber) = event_subscriber {
+                        room_event_cache_updates_task(
+                            room_event_cache,
+                            controller,
+                            event_subscriber,
+                            focus,
+                        )
+                        .await;
+                    }
+                }
                 .instrument(span)
             })
             .abort_on_drop();
@@ -242,7 +270,6 @@ impl TimelineBuilder {
                 _crypto_drop_handles: crypto_drop_handles,
                 _room_update_join_handle: room_update_join_handle,
                 _local_echo_listener_handle: local_echo_listener_handle,
-                _focus_drop_handle: focus_task,
                 _event_cache_drop_handle: event_cache_drop,
             }),
         };

@@ -70,8 +70,8 @@ pub use caches::{
     event_focused::EventFocusThreadMode,
     pagination::{BackPaginationOutcome, PaginationStatus},
     room::{
-        RoomEventCache, RoomEventCacheGenericUpdate, RoomEventCacheSubscriber,
-        RoomEventCacheUpdate, pagination::RoomPagination,
+        FocusedTimelineSnapshot, RoomEventCache, RoomEventCacheGenericUpdate,
+        RoomEventCacheSubscriber, RoomEventCacheUpdate, pagination::RoomPagination,
     },
     thread::pagination::ThreadPagination,
 };

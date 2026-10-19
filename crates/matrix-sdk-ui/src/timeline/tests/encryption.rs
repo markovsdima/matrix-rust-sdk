@@ -93,6 +93,15 @@ pub(super) async fn get_client(
 
 #[async_test]
 async fn test_retry_message_decryption() {
+    retry_message_decryption(false).await;
+}
+
+#[async_test]
+async fn test_retry_message_decryption_after_cache_rebuild() {
+    retry_message_decryption(true).await;
+}
+
+async fn retry_message_decryption(rebuild_before_keys: bool) {
     const SESSION_ID: &str = "gM8i47Xhu0q52xLfgUXzanCMpLinoyVyH7R58cBuVBU";
     const SESSION_KEY: &[u8] = b"\
         -----BEGIN MEGOLM SESSION DATA-----\n\
@@ -174,6 +183,37 @@ async fn test_retry_message_decryption() {
         assert_eq!(utds.len(), 1);
         assert_eq!(utds[0].event_id, event.event_id().unwrap());
         assert!(utds[0].time_to_decrypt.is_none());
+    }
+
+    if rebuild_before_keys {
+        let (cache, _drop_handles) = room.event_cache().await.unwrap();
+        let snapshot = cache.events().await.unwrap();
+        let (mut replica, mut rebuild_stream) = timeline.subscribe().await;
+        timeline
+            .controller
+            .replace_remote_events_after_cache_lag(
+                snapshot,
+                crate::timeline::event_item::RemoteEventOrigin::Cache,
+            )
+            .await;
+        use futures_util::{FutureExt, StreamExt};
+        while let Some(Some(diffs)) = rebuild_stream.next().now_or_never() {
+            for diff in diffs {
+                diff.apply(&mut replica);
+            }
+        }
+        let (current, _) = timeline.subscribe().await;
+        assert_eq!(format!("{replica:?}"), format!("{current:?}"));
+        assert!(
+            replica
+                .iter()
+                .filter_map(|item| item.as_event())
+                .any(|event| event.content().is_unable_to_decrypt())
+        );
+        // Start the decryption assertion after the completed rebuild. Importing
+        // keys below must still deliver the regular live Set update.
+        let (_, new_stream) = timeline.subscribe_filter_map(Some).await;
+        stream = new_stream;
     }
 
     let exported_keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "1234").unwrap();
@@ -289,6 +329,15 @@ async fn test_false_positive_late_decryption_regression() {
 
 #[async_test]
 async fn test_retry_edit_decryption() {
+    retry_edit_decryption(false).await;
+}
+
+#[async_test]
+async fn test_retry_edit_decryption_after_cache_rebuild() {
+    retry_edit_decryption(true).await;
+}
+
+async fn retry_edit_decryption(rebuild_before_keys: bool) {
     const SESSION1_KEY: &[u8] = b"\
         -----BEGIN MEGOLM SESSION DATA-----\n\
         AXou7bY+PWm0GrxTioyoKTkxAgfrQ5lGIla62WoBMrqWAAAACgXidLIt0gaK5NT3mGigzFAPjh/M0ibXjSvo\
@@ -394,6 +443,23 @@ async fn test_retry_edit_decryption() {
         timeline.items().await.iter().filter_map(|item| item.as_event().cloned()).collect();
     assert_eq!(items.len(), 2);
     let original_event_id = items[0].event_id().unwrap().to_owned();
+
+    if rebuild_before_keys {
+        let (cache, _drop_handles) = room.event_cache().await.unwrap();
+        timeline
+            .controller
+            .replace_remote_events_after_cache_lag(
+                cache.events().await.unwrap(),
+                crate::timeline::event_item::RemoteEventOrigin::Cache,
+            )
+            .await;
+        use futures_util::{FutureExt, StreamExt};
+        while let Some(Some(update)) = stream.next().now_or_never() {
+            update.apply(&mut items);
+        }
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|event| event.content().is_unable_to_decrypt()));
+    }
 
     // When we provide the keys for them a redecryption will trigger.
     let mut keys = decrypt_room_key_export(Cursor::new(SESSION1_KEY), "1234").unwrap();

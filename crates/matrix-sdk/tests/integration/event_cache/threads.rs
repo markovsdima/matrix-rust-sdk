@@ -14,7 +14,7 @@ use matrix_sdk::{
     },
     timeout::timeout,
 };
-use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
     OwnedEventId, OwnedRoomId, event_id,
     events::{
@@ -978,8 +978,8 @@ async fn test_redact_touches_threads() {
 async fn test_edits_touches_threads() {
     // We start with a thread with some replies, then receive an edit and an invalid
     // edit for the replies over sync. We observe that valid edits update the
-    // thread linked chunks as well as the thread summary on the thread root
-    // event. Invalid ones don't update the state.
+    // thread summary on the thread root event. Invalid ones must not change
+    // that summary, but their raw events still belong in the room cache.
 
     let s = thread_subscription_test_setup().await;
     let f = s.factory;
@@ -1058,19 +1058,28 @@ async fn test_edits_touches_threads() {
         .sync_room(
             &s.client,
             JoinedRoomBuilder::new(&s.room_id).add_timeline_event(
-                f.text_msg("Nobody speaks english anymore.").event_id(invalid_edit_id).edit(
-                    &room_events[2].event_id().unwrap(),
-                    RoomMessageEventContentWithoutRelation::text_plain("edited text"),
-                ),
+                f.text_msg("Nobody speaks english anymore.")
+                    .sender(*BOB)
+                    .event_id(invalid_edit_id)
+                    .edit(
+                        &room_events[2].event_id().unwrap(),
+                        RoomMessageEventContentWithoutRelation::text_plain("edited text"),
+                    ),
             ),
         )
         .await;
 
-    // It's a bit hard to know when the update should have been ready. This makes it
-    // hard to prove that no update happened.
-    let result = timeout(room_stream.recv(), Duration::from_secs(1)).await;
-
-    assert!(result.is_err(), "The room stream should have timed out as the edit was invnalid");
+    // An edit from another sender is invalid as a replacement. Its raw event
+    // must still be appended, without a Set changing the thread root summary.
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+            room_stream.recv()
+    );
+    assert_eq!(diffs.len(), 1);
+    assert_let!(VectorDiff::Append { values } = &diffs[0]);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].event_id().as_deref(), Some(invalid_edit_id));
+    assert!(thread_stream.is_empty());
 
     let room_events = room_event_cache.events().await.unwrap();
     let first = room_events.first().unwrap();

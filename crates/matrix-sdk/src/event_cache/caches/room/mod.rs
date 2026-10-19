@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod focused;
 pub mod pagination;
 mod state;
 mod subscriber;
+pub use focused::FocusedTimelineSnapshot;
 mod updates;
 
 use std::{
@@ -115,8 +117,31 @@ impl RoomEventCache {
     /// Use [`RoomEventCache::events`] to get all current events without the
     /// subscriber. Creating, and especially dropping, a
     /// [`RoomEventCacheSubscriber`] isn't free, as it triggers side-effects.
+    ///
+    /// The returned events and subscriber form a consistent boundary: timeline
+    /// diffs already reflected in the events will not be delivered again, and
+    /// subsequent timeline mutations will be delivered through the subscriber.
+    /// Non-timeline updates (receipts, read markers and members) are not included
+    /// in the events; a consumer recovering from lag must refresh those separately.
     pub async fn subscribe(&self) -> Result<(Vec<Event>, RoomEventCacheSubscriber)> {
-        let state = self.inner.state.read().await?;
+        let mut state = self.inner.state.write().await?;
+
+        // Mutators publish while holding the write lock. A failed or cancelled
+        // mutator may nevertheless leave pending diffs, since persisting and
+        // post-processing changes involves await points. Publish those before
+        // taking the snapshot and creating its receiver, so they cannot cross
+        // the snapshot boundary in a later mutation's batch.
+        let diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
+        if !diffs.is_empty() {
+            self.inner.update_sender.send(
+                RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                    diffs,
+                    origin: EventsOrigin::Cache,
+                }),
+                Some(RoomEventCacheGenericUpdate { room_id: self.inner.room_id.clone() }),
+            );
+        }
+
         let events =
             state.room_linked_chunk().events().map(|(_position, item)| item.clone()).collect();
 
@@ -354,7 +379,8 @@ impl RoomEventCache {
     /// storage.
     pub async fn clear(&self) -> Result<()> {
         // Clear the linked chunk and persisted storage.
-        let updates_as_vector_diffs = self.inner.state.write().await?.reset().await?;
+        let mut state = self.inner.state.write().await?;
+        let updates_as_vector_diffs = state.reset().await?;
 
         // Notify observers about the update.
         self.inner.update_sender.send(
@@ -600,16 +626,16 @@ impl RoomEventCacheInner {
         let (stored_prev_batch_token, timeline_event_diffs) =
             state.handle_sync(timeline, &ephemeral_events).await?;
 
-        drop(state);
-
         // Now that all events have been added, we can trigger the
         // `pagination_token_notifier`.
         if stored_prev_batch_token {
             self.pagination_batch_token_notifier.notify_one();
         }
 
-        // The order matters here: first send the timeline event diffs, then only the
-        // related events (read receipts, etc.).
+        // Publish before releasing the state lock: subscribe() must never return
+        // a snapshot containing this mutation followed by its positional diffs.
+        // The order matters here: first send the timeline event diffs, then only
+        // the related events (read receipts, etc.).
         if !timeline_event_diffs.is_empty() {
             self.update_sender.send(
                 RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
@@ -641,6 +667,9 @@ pub(in super::super) enum PostProcessingOrigin {
     #[cfg(feature = "e2e-encryption")]
     Redecryption,
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod snapshot_boundary_tests;
 
 #[cfg(test)]
 mod tests {

@@ -60,6 +60,7 @@ mod redecryption_queue;
 mod replies;
 mod subscribe;
 mod thread;
+mod update_volume;
 
 mod rtc;
 pub(crate) mod sliding_sync;

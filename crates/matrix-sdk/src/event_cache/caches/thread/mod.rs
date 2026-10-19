@@ -32,6 +32,7 @@ use super::{
 use crate::room::WeakRoom;
 
 /// All the information related to a single thread.
+#[derive(Clone)]
 pub(super) struct ThreadEventCache {
     inner: Arc<ThreadEventCacheInner>,
 }
@@ -79,7 +80,12 @@ impl ThreadEventCache {
 
     /// Subscribe to live events from this thread.
     pub async fn subscribe(&self) -> Result<(Vec<Event>, Receiver<TimelineVectorDiffs>)> {
-        let state = self.inner.state.read().await?;
+        let mut state = self.inner.state.write().await?;
+        let diffs = state.thread_linked_chunk_mut().updates_as_vector_diffs();
+        if !diffs.is_empty() {
+            let _ =
+                state.state.sender.send(TimelineVectorDiffs { diffs, origin: EventsOrigin::Cache });
+        }
 
         let events =
             state.thread_linked_chunk().events().map(|(_position, item)| item.clone()).collect();
@@ -87,6 +93,54 @@ impl ThreadEventCache {
         let recv = state.state.sender.subscribe();
 
         Ok((events, recv))
+    }
+
+    /// The caller already holds the room lock, matching the room -> thread
+    /// order used by sync. Hold the thread lock through hydration and repairs
+    /// so pagination cannot invalidate positions or replay pre-snapshot diffs.
+    pub(in crate::event_cache) async fn subscribe_with_room_updates(
+        &self,
+        room: &super::room::RoomEventCache,
+        room_state: super::room::RoomEventCacheStateLockWriteGuard<'_>,
+    ) -> Result<super::room::FocusedTimelineSnapshot> {
+        let mut state = self.inner.state.write().await?;
+        let diffs = state.thread_linked_chunk_mut().updates_as_vector_diffs();
+        if !diffs.is_empty() {
+            let _ = state.sender.send(TimelineVectorDiffs { diffs, origin: EventsOrigin::Cache });
+        }
+        let events = state.thread_linked_chunk().events().map(|(_, event)| event.clone()).collect();
+        let receiver = state.sender.subscribe();
+        let (mut snapshot, repairs) =
+            room.focused_snapshot_locked(room_state, events, receiver, true).await?;
+        if !repairs.is_empty() {
+            // Like Event focus, repair the backing cache too. Read positions
+            // once under the same lock, avoiding a scan for each replacement.
+            let mut repairs = repairs.into_iter().peekable();
+            let replacements: Vec<_> = state
+                .thread_linked_chunk()
+                .events()
+                .enumerate()
+                .filter_map(|(index, (position, _))| {
+                    if repairs.peek().is_some_and(|(repair_index, _)| *repair_index == index) {
+                        let (_, event) = repairs.next().unwrap();
+                        Some((position, event))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (position, event) in replacements {
+                state
+                    .thread_linked_chunk_mut()
+                    .replace_event_at(position, event)
+                    .expect("position was read under the same thread lock");
+            }
+            state.propagate_changes().await?;
+            let diffs = state.thread_linked_chunk_mut().updates_as_vector_diffs();
+            let _ = state.sender.send(TimelineVectorDiffs { diffs, origin: EventsOrigin::Cache });
+            snapshot.updates = state.sender.subscribe();
+        }
+        Ok(snapshot)
     }
 
     /// Return a [`ThreadPagination`] useful for running back-pagination queries
